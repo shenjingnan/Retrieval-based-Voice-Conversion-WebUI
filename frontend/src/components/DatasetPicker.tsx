@@ -83,6 +83,13 @@ export function DatasetPicker({ selectedPath, onSelect, onUploaded, trainingRunn
 
   /** 选中项：以 path 对齐（name 可能被外部重建，path 才是 dataset_dir 的事实来源） */
   const selected = datasets?.find((d) => d.path === selectedPath) ?? null
+  // 删除回调里不能读 render 期的 selected：删除请求在途时用户可能已改选别的数据集，
+  // 旧闭包里的 selected 仍命中被删的名字 → 会把用户的新选中误清空。用 latest-ref 惯用法
+  // 跟踪最新选中名（effect 内写入，避免 render 期碰 ref）
+  const selectedNameRef = useRef<string | null>(null)
+  useEffect(() => {
+    selectedNameRef.current = selected?.name ?? null
+  }, [selected])
   const selectItems = useMemo(
     () => (datasets ?? []).map((d) => ({ value: d.name, label: d.name })),
     [datasets],
@@ -185,9 +192,10 @@ export function DatasetPicker({ selectedPath, onSelect, onUploaded, trainingRunn
       .deleteDataset(name)
       .then(() => {
         if (!mounted.current) return
-        // 删掉的是当前选中 → 清空父级选中，别让表单指向已消失的目录。
+        // 删掉的是当前选中 → 清空父级选中，别让表单指向已消失的目录。经 selectedNameRef
+        // 取最新选中（在途期间用户可能已改选），不能读本闭包捕获的旧 selected。
         // 刷新失败只走列表区的 loadError 提示，不能算作「删除失败」（目录已删除成功）
-        if (selected?.name === name) onSelect(null)
+        if (selectedNameRef.current === name) onSelect(null)
         void refresh()
       })
       .catch((e: unknown) => {
@@ -273,9 +281,12 @@ export function DatasetPicker({ selectedPath, onSelect, onUploaded, trainingRunn
             if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false)
           }}
           onDrop={onDrop}
+          // 上传在途只做视觉弱化，不加 pointer-events-none：那会让 drop 落到没有
+          // preventDefault 的祖先元素上 → 浏览器直接打开被拖的文件、页面状态丢失。
+          // 在途误拖由 onDrop → addFiles 的 progress 守卫拦下（第二道防线）
           className={`flex flex-wrap items-center justify-center gap-2 rounded-lg p-4 text-center transition-colors ${
             dragOver ? 'border-border bg-muted' : ''
-          } ${progress !== null ? 'pointer-events-none opacity-60' : ''}`}
+          } ${progress !== null ? 'opacity-60' : ''}`}
         >
           <UploadIcon className="size-4 text-muted-foreground" />
           <span className="text-sm text-muted-foreground">拖拽音频文件到此处，或</span>
@@ -425,6 +436,7 @@ export function DatasetPicker({ selectedPath, onSelect, onUploaded, trainingRunn
                   <Button
                     variant="outline"
                     size="xs"
+                    disabled={progress !== null}
                     onClick={() => {
                       // 先选中（上传目标随之落到该数据集）再打开文件选择；选完文件由
                       // 「留空则追加到当前选中」承接，无需在这里填名字
@@ -437,7 +449,9 @@ export function DatasetPicker({ selectedPath, onSelect, onUploaded, trainingRunn
                   <Button
                     variant="destructive"
                     size="xs"
-                    disabled={trainingRunning || deleting !== null}
+                    // 上传在途一并禁删：删除与上传并发写同一目录，后端没有这层互斥，
+                    // UI 先挡住（纵深防御）
+                    disabled={trainingRunning || deleting !== null || progress !== null}
                     title={
                       trainingRunning
                         ? '训练任务进行中，后端拒绝删除数据集'

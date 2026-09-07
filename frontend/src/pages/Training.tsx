@@ -602,24 +602,24 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
               selectedPath={pickedPath.length > 0 ? pickedPath : null}
               onSelect={(ds) => setPickedPath(ds === null ? '' : ds.path)}
               onUploaded={(r) => {
-                // 上传成功即把后端下发的绝对路径回填 dataset_dir：表单立即可提交
-                setDatasetSource('pick')
+                // 上传成功即把后端下发的绝对路径回填 dataset_dir：表单立即可提交。
+                // 本控件只在 pick 来源下渲染，无需再 setDatasetSource
                 setPickedPath(r.path)
               }}
               trainingRunning={running}
             />
           ) : (
             <Collapsible defaultOpen>
+              {/* 触发器用字段名而非来源名：来源切换按钮已叫「手动填服务器路径」，
+                  同屏两个同名可点击元素会让人分不清哪个控制什么 */}
               <CollapsibleTrigger className={COLLAPSIBLE_TRIGGER_CLASS}>
-                手动填服务器路径
+                数据集路径
                 <ChevronDownIcon className="size-4 text-muted-foreground" />
               </CollapsibleTrigger>
               <CollapsibleContent className="flex flex-col gap-1.5 pt-4">
-                <label htmlFor="train-dataset" className="text-sm font-medium">
-                  数据集路径
-                </label>
                 <Input
                   id="train-dataset"
+                  aria-label="数据集路径"
                   value={manualDir}
                   onChange={(e) => setManualDir(e.target.value)}
                   placeholder="服务器上的目录路径，如 /data/dataset"
