@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 
 import { api, type ModelVersion, type SampleRate, type TaskCreated, type TrainF0Method, type TrainParams } from '@/api/client'
+import { DatasetPicker } from '@/components/DatasetPicker'
 import { useTask, type LossPoint } from '@/hooks/useTask'
 import { DATASET_BAD_RE, EXP_NAME_RE, pickProductName } from '@/lib/domain'
 import { COLLAPSIBLE_TRIGGER_CLASS } from '@/lib/ui'
@@ -277,7 +278,14 @@ export interface TrainingPageProps {
 export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   // -- 表单（基础） ---------------------------------------------------------
   const [expName, setExpName] = useState('')
-  const [datasetDir, setDatasetDir] = useState('')
+  // 数据集来源：pick = 服务器数据集下拉/上传（DatasetPicker，主控件）；
+  // manual = 手填服务器路径（数据已在 GPU 服务器上时的兜底）。两个来源各自记忆，
+  // 来回切换不丢已填内容
+  const [datasetSource, setDatasetSource] = useState<'pick' | 'manual'>('pick')
+  const [pickedPath, setPickedPath] = useState('')
+  const [manualDir, setManualDir] = useState('')
+  // 向导其余逻辑只认 dataset_dir 字符串：按来源派生，提交参数不区分来源
+  const datasetDir = datasetSource === 'pick' ? pickedPath : manualDir
   // -- 表单（高级，默认值对齐 webui / server/api/training.py） ----------------
   const [sr, setSr] = useState<SampleRate>('40k')
   const [ifF0, setIfF0] = useState(true)
@@ -328,8 +336,12 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
 
   // -- 校验（派生） ---------------------------------------------------------
   const expNameValid = expName !== '.' && expName !== '..' && EXP_NAME_RE.test(expName)
+  // pick 来源的路径由后端下发（数据集目录的绝对路径），天然合法，不跑字符集正则；
+  // manual 来源仍是用户手填，沿用后端 _check_dataset_dir 的同源字符校验
   const datasetValid =
-    datasetDir.length > 0 && !DATASET_BAD_RE.test(datasetDir) && !datasetDir.endsWith('\\')
+    datasetSource === 'pick'
+      ? pickedPath.length > 0
+      : manualDir.length > 0 && !DATASET_BAD_RE.test(manualDir) && !manualDir.endsWith('\\')
   const epochsValid =
     totalEpoch >= 1 && saveEveryEpoch >= 1 && (batchSize === null || batchSize >= 1)
   const formValid = expNameValid && datasetValid && epochsValid
@@ -467,7 +479,7 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
       ? '实验名不能为空，且不得含空格、引号、反斜杠、$、反引号或路径分隔符'
       : null
   const datasetHint =
-    datasetDir.length > 0 && !datasetValid
+    datasetSource === 'manual' && manualDir.length > 0 && !datasetValid
       ? '路径不得含引号、$、反引号、换行，且不能以反斜杠结尾'
       : null
   const epochsHint = !epochsValid
@@ -508,7 +520,7 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
       <CardHeader>
         <CardTitle>训练</CardTitle>
         <CardDescription>
-          准备一个含人声 wav 的文件夹路径，配置实验后即可一键训练或分步执行。
+          上传音频或填写服务器数据集路径，配置实验后即可一键训练或分步执行。
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-6">
@@ -541,43 +553,92 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
         </ol>
 
         {/* 表单：基础 */}
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="flex flex-col gap-1.5">
-            <label htmlFor="train-exp" className="text-sm font-medium">
-              实验名
-            </label>
-            <Input
-              id="train-exp"
-              value={expName}
-              onChange={(e) => setExpName(e.target.value)}
-              placeholder="如 my-voice"
-              aria-invalid={expNameHint !== null}
-            />
-            {expNameHint !== null && <p className="text-xs text-destructive">{expNameHint}</p>}
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <label htmlFor="train-dataset" className="text-sm font-medium">
-              数据集路径
-            </label>
-            <Input
-              id="train-dataset"
-              value={datasetDir}
-              onChange={(e) => setDatasetDir(e.target.value)}
-              placeholder="服务器上的目录路径，如 /data/dataset"
-              aria-invalid={datasetHint !== null}
-            />
-            {datasetHint !== null ? (
-              <p className="text-xs text-destructive">{datasetHint}</p>
-            ) : (
+        <div className="flex flex-col gap-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="train-exp" className="text-sm font-medium">
+                实验名
+              </label>
+              <Input
+                id="train-exp"
+                value={expName}
+                onChange={(e) => setExpName(e.target.value)}
+                placeholder="如 my-voice"
+                aria-invalid={expNameHint !== null}
+              />
+              {expNameHint !== null && <p className="text-xs text-destructive">{expNameHint}</p>}
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <span className="text-sm font-medium">数据集</span>
+              {/* 来源切换：pick 为主控件（上传/下拉），manual 为手填兜底 */}
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={datasetSource === 'pick' ? 'secondary' : 'outline'}
+                  onClick={() => setDatasetSource('pick')}
+                >
+                  选择 / 上传数据集
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={datasetSource === 'manual' ? 'secondary' : 'outline'}
+                  onClick={() => setDatasetSource('manual')}
+                >
+                  手动填服务器路径
+                </Button>
+              </div>
               <p className="text-xs text-muted-foreground">
-                服务器上的目录路径（浏览器无法选择远端目录）；目录内放要训练的人声 wav
+                {datasetSource === 'pick'
+                  ? '在服务器上选择已有数据集，或直接从浏览器上传音频自动创建'
+                  : '数据已在 GPU 服务器上时，直接填目录路径'}
               </p>
-            )}
+            </div>
           </div>
+
+          {datasetSource === 'pick' ? (
+            <DatasetPicker
+              selectedPath={pickedPath.length > 0 ? pickedPath : null}
+              onSelect={(ds) => setPickedPath(ds === null ? '' : ds.path)}
+              onUploaded={(r) => {
+                // 上传成功即把后端下发的绝对路径回填 dataset_dir：表单立即可提交
+                setDatasetSource('pick')
+                setPickedPath(r.path)
+              }}
+              trainingRunning={running}
+            />
+          ) : (
+            <Collapsible defaultOpen>
+              <CollapsibleTrigger className={COLLAPSIBLE_TRIGGER_CLASS}>
+                手动填服务器路径
+                <ChevronDownIcon className="size-4 text-muted-foreground" />
+              </CollapsibleTrigger>
+              <CollapsibleContent className="flex flex-col gap-1.5 pt-4">
+                <label htmlFor="train-dataset" className="text-sm font-medium">
+                  数据集路径
+                </label>
+                <Input
+                  id="train-dataset"
+                  value={manualDir}
+                  onChange={(e) => setManualDir(e.target.value)}
+                  placeholder="服务器上的目录路径，如 /data/dataset"
+                  aria-invalid={datasetHint !== null}
+                />
+                {datasetHint !== null ? (
+                  <p className="text-xs text-destructive">{datasetHint}</p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    服务器上的目录路径（浏览器无法选择远端目录）；目录内放要训练的人声 wav
+                  </p>
+                )}
+              </CollapsibleContent>
+            </Collapsible>
+          )}
         </div>
 
-        {/* 空状态引导 */}
-        {datasetDir.length === 0 && (
+        {/* 空状态引导（pick 来源的空态由 DatasetPicker 自带） */}
+        {datasetSource === 'manual' && manualDir.length === 0 && (
           <p className="rounded-lg bg-muted p-3 text-xs text-muted-foreground">
             还没有数据集：请先在服务器上准备一个文件夹，里面放若干人声 wav（建议 2
             分钟以上、无伴奏无混响），把文件夹路径填到上方即可开始。
