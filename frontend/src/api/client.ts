@@ -58,6 +58,50 @@ export interface DeleteModelResult {
   failed_indices: string[]
 }
 
+/** GET /api/datasets 的条目（server/api/datasets.py _scan_dataset 的 summary，逐字段对齐） */
+export interface DatasetSummary {
+  name: string
+  /** 数据集目录在服务器上的绝对路径（后端下发，前端原样回填 dataset_dir，不自行拼路径） */
+  path: string
+  /** 音频文件数（点开头文件不计入） */
+  file_count: number
+  /** 非音频文件数：preprocess 遍历目录不过滤扩展名，这些文件也会被切分脚本处理 */
+  other_count: number
+  total_bytes: number
+  /** 秒；时长探测全失败（含空数据集）为 null，前端显示「未知」而非误导性的 0 秒 */
+  total_duration: number | null
+}
+
+/** GET /api/datasets/{name}：概览字段 + files 明细（音频文件，按名排序） */
+export interface DatasetDetail extends DatasetSummary {
+  files: Array<{ name: string; size: number; duration: number | null }>
+}
+
+/** 上传响应里被后端拒收的单个文件（非音频 / 0 字节 / 点开头 / 空文件名） */
+export interface SkippedFile {
+  name: string
+  reason: string
+}
+
+/** POST /api/datasets/{name}/files 的返回体（multipart `files`，可多文件） */
+export interface UploadResult {
+  dataset: string
+  path: string
+  /** true = 本次新建了数据集目录；false = 追加到已有目录（重名数据集即追加，非错误） */
+  created: boolean
+  /** 实际落盘的文件名（与目录内已有文件重名时已按 stem_1.ext 改写） */
+  added: string[]
+  skipped: SkippedFile[]
+  file_count: number
+  total_duration: number | null
+}
+
+/** DELETE /api/datasets/{name} 的返回体：删除失败（占用/权限）的文件如实上报，不回滚 */
+export interface DeleteDatasetResult {
+  deleted: boolean
+  failed_files: string[]
+}
+
 /**
  * 从错误响应提取可读信息。detail 仅在为字符串时使用——
  * FastAPI 422 校验错误的 detail 是对象数组，直接塞给 Error 会得到 "[object Object]"，
@@ -67,6 +111,20 @@ async function errorFrom(resp: Response): Promise<Error> {
   const body: unknown = await resp.json().catch(() => null)
   const detail = (body as { detail?: unknown } | null)?.detail
   return new Error(typeof detail === 'string' ? detail : `HTTP ${resp.status}`)
+}
+
+/**
+ * errorFrom 的同步版（XMLHttpRequest 拿到的是 .responseText 字符串，没有 Response.json）：
+ * detail 提取语义与 errorFrom 完全一致——仅字符串 detail 可用，否则回退 HTTP 状态码。
+ */
+function errorFromText(text: string, status: number): Error {
+  let detail: unknown = null
+  try {
+    detail = (JSON.parse(text) as { detail?: unknown } | null)?.detail
+  } catch {
+    detail = null // 非 JSON body（网关错误页等）：与解析失败同义，回退状态码
+  }
+  return new Error(typeof detail === 'string' ? detail : `HTTP ${status}`)
 }
 
 async function handle<T>(resp: Response): Promise<T> {
@@ -96,6 +154,58 @@ export const api = {
     fetch('/api/infer', { method: 'POST', body: form }).then(async (r) => {
       if (!r.ok) throw await errorFrom(r)
       return r.blob()
+    }),
+
+  // -- 数据集：列表 / 详情 / 上传 / 删除（server/api/datasets.py） ----------------
+
+  datasets: (): Promise<DatasetSummary[]> =>
+    fetch('/api/datasets').then((r) => handle<DatasetSummary[]>(r)),
+
+  dataset: (name: string): Promise<DatasetDetail> =>
+    fetch(`/api/datasets/${encodeURIComponent(name)}`).then((r) => handle<DatasetDetail>(r)),
+
+  deleteDataset: (name: string): Promise<DeleteDatasetResult> =>
+    fetch(`/api/datasets/${encodeURIComponent(name)}`, { method: 'DELETE' }).then((r) =>
+      handle<DeleteDatasetResult>(r),
+    ),
+
+  /**
+   * 上传音频到数据集（目录不存在则建、存在则追加），onProgress 上报 0-100 的百分比。
+   *
+   * 必须用 XMLHttpRequest 而不是 fetch：fetch 的流式能力只覆盖「下载」方向
+   * （Response.body），请求体的上传进度只有 XHR 的 xhr.upload.onprogress 能拿到
+   * （ProgressEvent.loaded/total），fetch 没有对应的可观测接口。组件侧卸载后无法
+   * 中止（abort 会把用户切 Tab 误当成上传失败），由调用方自行丢弃迟到回调。
+   */
+  uploadDataset: (
+    name: string,
+    files: File[],
+    onProgress: (pct: number) => void,
+  ): Promise<UploadResult> =>
+    new Promise<UploadResult>((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', `/api/datasets/${encodeURIComponent(name)}/files`)
+      xhr.upload.onprogress = (e) => {
+        // lengthComputable 为 false（通常是请求体大小未知）时保持上一次的进度值
+        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+      }
+      // 网络层失败（断网 / 中断 / 被代理拒绝）：status 恒为 0，detail 无从解析
+      xhr.onerror = () => reject(new Error('网络错误，上传中断'))
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText) as UploadResult)
+          } catch {
+            reject(new Error(`HTTP ${xhr.status}`))
+          }
+          return
+        }
+        reject(errorFromText(xhr.responseText, xhr.status))
+      }
+      const form = new FormData()
+      // 字段名固定 `files`（后端 list[UploadFile]），逐个 append 即多文件
+      for (const f of files) form.append('files', f, f.name)
+      xhr.send(form)
     }),
 
   // -- 训练：4 步 + 一键（字段子集见 server/api/training.py 各 Body 模型） --------
