@@ -7,12 +7,13 @@
 注意 monkeypatch 纪律：paths 以模块属性访问（paths.DATASETS_DIR），不得 from-import，
 否则测试把根目录指到 tmp_path 的隔离手段失效。
 """
+import contextlib
 import json
 import logging
 import os
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from server import paths
 # 与 training._check_exp_name 同源的非法字符表（勿在本模块复制一份，改一处必须同源）
@@ -29,6 +30,9 @@ MAX_FILE_BYTES = 500 * 1024 * 1024
 MAX_BATCH_BYTES = 2 * 1024 * 1024 * 1024
 # 侧车缓存目录：必须位于各数据集目录之外（放数据集目录内会被 preprocess 当音频再解一次）
 META_DIRNAME = ".meta"
+# 流式落盘的 read 粒度：内存占用与拷贝次数的折中（FastAPI 的 UploadFile spool 阈值
+# 也是 1MB，超过即滚到磁盘临时文件，配合本粒度全程只有一块数据在内存里）
+CHUNK_BYTES = 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +75,82 @@ def _iter_audio(directory: Path) -> tuple[list, list]:
             continue
         (audios if path.suffix.lower() in AUDIO_SUFFIXES else others).append(path)
     return audios, others
+
+
+# ---------------------------------------------------------------------------
+# 上传
+# ---------------------------------------------------------------------------
+
+
+class _QuotaExceeded(Exception):
+    """上传超出大小软限制（单文件或批次累计）；API 层转 413。limit 供 detail 展示。"""
+
+    def __init__(self, message: str, limit: int):
+        super().__init__(message)
+        self.limit = limit
+
+
+def _safe_filename(name: str) -> str:
+    """multipart 的 filename → 可安全落盘的单段文件名。
+
+    客户端可能把完整路径塞进 filename（Windows 常见）：`/` 与反斜杠都当路径分隔符
+    取 basename。C0 控制字符（0x00-0x1f，含回车换行）替换为 `_` 而非删除——删除会让
+    控制字符版本与删除后的名字撞名；中文/emoji/空格等常规字符原样保留。basename 后
+    为空（空串或纯分隔符）→ 返回空串，调用方按 skip 处理。
+    """
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    return "".join("_" if ord(ch) < 0x20 else ch for ch in base)
+
+
+def _unique_path(directory: Path, filename: str, taken: set) -> Path:
+    """目录内不重名的落盘路径：重名 → stem_1.ext 递增。
+
+    taken 是本批次已分配的名字——同批两份 a.wav 落盘前谁也不 exists()，必须靠集合
+    防互撞；磁盘已有文件（无论是不是音频）也一律视为占用。永不覆盖用户数据。
+    """
+    candidate = directory / filename
+    if candidate.name in taken or candidate.exists():
+        stem, suffix = candidate.stem, candidate.suffix
+        n = 0
+        while candidate.name in taken or candidate.exists():
+            n += 1
+            candidate = directory / f"{stem}_{n}{suffix}"
+    taken.add(candidate.name)
+    return candidate
+
+
+def _save_stream(upload: UploadFile, target: Path, file_limit: int, batch_budget: int) -> int:
+    """把上传文件的 spool 流式写到 target，返回写入字节数。
+
+    读一块写一块（CHUNK_BYTES 粒度），写盘中即时核对两条限额：file_limit 为单文件
+    上限，batch_budget 为本批剩余额度（累计上限 − 已落盘字节数）——大小限制是软限制，
+    不信 Content-Length、不预读整个流，超限即刻中止。任何异常路径都先删掉半成品再
+    上抛：磁盘上只允许出现完整文件。
+    """
+    written = 0
+    try:
+        with target.open("wb") as out:
+            while chunk := upload.file.read(CHUNK_BYTES):
+                written += len(chunk)
+                if written > file_limit:
+                    raise _QuotaExceeded("单个文件超过大小上限", file_limit)
+                if written > batch_budget:
+                    raise _QuotaExceeded("超过单次上传的累计大小上限", batch_budget)
+                out.write(chunk)
+    except BaseException:  # noqa: BLE001 半成品清理必须覆盖 413 与 IO 错误两条路径
+        with contextlib.suppress(OSError):
+            target.unlink(missing_ok=True)
+        raise
+    return written
+
+
+def _probe_spool_size(upload: UploadFile) -> int:
+    """spool 里的字节数（FastAPI 在 handler 之前已把整个 part 收进 spool，seek/tell
+    即真实大小）。0 字节文件据此提前 skip，不落盘。"""
+    upload.file.seek(0, os.SEEK_END)
+    size = upload.file.tell()
+    upload.file.seek(0)
+    return size
 
 
 # ---------------------------------------------------------------------------
@@ -218,3 +298,110 @@ def dataset_detail(name: str):
     summary, files = _scan_dataset(directory)
     summary["files"] = files
     return summary
+
+
+@router.post("/{name}/files")
+def upload_dataset_files(name: str, files: list[UploadFile] = File(...)):
+    """上传音频（multipart `files`，浏览器可多选/拖拽）：目录不存在则建、存在则追加。
+
+    必须用 list[UploadFile]（SpooledTemporaryFile 流式，>1MB 滚到磁盘临时文件），不可
+    换成 `bytes = File(...)` 的全量内存模式。逐文件：名字可安全化 → 后缀是音频 → 非
+    0 字节 → 取不重名路径 → 流式落盘 → 探测时长写侧车。大小限制是软限制：写盘中计数、
+    即时中止、半成品删除；已完成的文件保留计入 added（不回滚），所以 413 之后磁盘上
+    可能已有本次的部分文件。全 skip 且目录是本次新建 → 400 并删掉刚建的空目录。
+    """
+    directory = _dataset_dir(name)  # 非法名 → 400
+    if not files:
+        raise HTTPException(400, "未选择任何文件")
+    created = not directory.is_dir()
+    if created:
+        try:
+            # exist_ok：并发请求刚好先建了同一目录时按追加处理，不打 500
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.exception("数据集目录创建失败：%s", directory)
+            raise HTTPException(500, "数据集目录创建失败：%s" % name)
+
+    added: list[str] = []
+    skipped: list[dict] = []
+    saved: list[Path] = []
+    batch_written = 0
+    taken: set = set()
+
+    def _discard_empty_new_dir() -> None:
+        """中止路径（413/500）的收尾：目录是本次新建且一个文件都没落成 → 删掉，
+        不让列表里出现空数据集（与全 skip 的 400 同一纪律）。"""
+        if created and not added:
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+
+    for upload in files:
+        original = upload.filename or ""
+        safe = _safe_filename(original)
+        if not safe:
+            skipped.append({"name": original, "reason": "文件名为空"})
+            continue
+        suffix = Path(safe).suffix.lower()
+        if suffix not in AUDIO_SUFFIXES:
+            supported = " ".join(sorted(AUDIO_SUFFIXES))
+            skipped.append(
+                {
+                    "name": safe,
+                    "reason": "不支持的音频格式：%s（支持 %s）" % (suffix or "无后缀", supported),
+                }
+            )
+            continue
+        if _probe_spool_size(upload) == 0:
+            skipped.append({"name": safe, "reason": "空文件（0 字节）"})
+            continue
+
+        target = _unique_path(directory, safe, taken)
+        try:
+            written = _save_stream(
+                upload, target, MAX_FILE_BYTES, MAX_BATCH_BYTES - batch_written
+            )
+        except _QuotaExceeded as exc:
+            _discard_empty_new_dir()
+            raise HTTPException(
+                413, "%s：%s（上限 %d MB）" % (exc, safe, exc.limit // (1024 * 1024))
+            )
+        except OSError:
+            logger.exception("上传落盘失败：%s", target)
+            _discard_empty_new_dir()
+            raise HTTPException(
+                500, "写入 %s 失败（已成功写入 %d 个文件，已落盘文件保留）" % (safe, len(added))
+            )
+        added.append(target.name)
+        saved.append(target)
+        batch_written += written
+
+    if not added and created:
+        # 全 skip 且目录是本次新建 → 400，不留空目录
+        with contextlib.suppress(OSError):
+            directory.rmdir()
+        detail = "; ".join(f"{s['name']}（{s['reason']}）" for s in skipped)
+        raise HTTPException(400, "没有可用的音频文件，全部被跳过：%s" % detail)
+
+    # 时长探测写侧车（键与 _scan_dataset 一致）；随后的统计扫描会命中刚写的缓存，
+    # 不会重复探测。413/500 中止路径不走这里——没探测的文件由下次 GET 补侧车。
+    if saved:
+        cache = _cache_load(name)
+        for path in saved:
+            stat = path.stat()
+            cache[path.name] = {
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "duration": _audio_duration(path),
+            }
+        _cache_store(name, cache)
+
+    summary, _ = _scan_dataset(directory)
+    return {
+        "dataset": name,
+        "path": str(directory),
+        "created": created,
+        "added": added,
+        "skipped": skipped,
+        "file_count": summary["file_count"],
+        "total_duration": summary["total_duration"],
+    }

@@ -1,7 +1,9 @@
 """数据集 API 测试。全部用例把 paths.DATASETS_DIR monkeypatch 到 tmp_path 隔离：
 服务跑在 main 工作区、测试跑在 worktree，不共享真实 datasets/ 目录。"""
+import io
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -10,7 +12,12 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from server import paths
-from server.api.datasets import _audio_duration, _check_name
+from server.api.datasets import (
+    _audio_duration,
+    _check_name,
+    _safe_filename,
+    _unique_path,
+)
 from server.main import create_app
 
 
@@ -31,6 +38,28 @@ def _write_wav(path, seconds=1.0, rate=16000):
     t = np.linspace(0.0, seconds, int(rate * seconds), endpoint=False)
     sf.write(path, (0.3 * np.sin(2 * np.pi * 440 * t)).astype("float32"), rate, subtype="PCM_16")
     return path
+
+
+def _wav_bytes(seconds=1.0, rate=16000):
+    """内存中的 wav 字节（上传 body 用）。BytesIO 无文件名，须显式给 format。"""
+    buf = io.BytesIO()
+    t = np.linspace(0.0, seconds, int(rate * seconds), endpoint=False)
+    sf.write(
+        buf,
+        (0.3 * np.sin(2 * np.pi * 440 * t)).astype("float32"),
+        rate,
+        subtype="PCM_16",
+        format="WAV",
+    )
+    return buf.getvalue()
+
+
+def _upload(client, name, files):
+    """POST multipart：files 为 [(filename, bytes)]。"""
+    return client.post(
+        f"/api/datasets/{name}/files",
+        files=[("files", (fname, data)) for fname, data in files],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +282,240 @@ def test_dataset_detail_files_sorted(client):
     assert by_name["a.wav"]["duration"] == pytest.approx(2.0, abs=0.1)
     assert by_name["a.wav"]["size"] == (dataset / "a.wav").stat().st_size
     assert by_name["b.wav"]["duration"] == pytest.approx(1.0, abs=0.1)
+
+
+# ---------------------------------------------------------------------------
+# 上传：落盘 / 重名序号 / skip / 大小软限制
+# ---------------------------------------------------------------------------
+
+
+def test_safe_filename_normalizes_path_and_control_chars():
+    """basename 化（/ 与 \\ 都当分隔符）+ C0 控制字符替换为 _；常规字符原样保留。"""
+    assert _safe_filename("C:\\Users\\me\\a.wav") == "a.wav"
+    assert _safe_filename("/tmp/x/b.wav") == "b.wav"
+    assert _safe_filename("a\x01\x02b.wav") == "a__b.wav"
+    assert _safe_filename("a\r\nb.wav") == "a__b.wav"
+    assert _safe_filename("中文🎉 c.wav") == "中文🎉 c.wav"
+    assert _safe_filename("") == ""
+    assert _safe_filename("\\\\") == ""  # 纯分隔符 → basename 为空 → 调用方 skip
+
+
+def test_unique_path_avoids_disk_and_batch_collisions(tmp_path):
+    """重名递增 _1/_2；磁盘已有文件（含恰好叫 a_1 的）与同批已分配名都视为占用。"""
+    (tmp_path / "a.wav").write_bytes(b"first")
+    taken: set = set()
+    assert _unique_path(tmp_path, "a.wav", taken).name == "a_1.wav"
+    (tmp_path / "a_1.wav").write_bytes(b"preexisting")
+    assert _unique_path(tmp_path, "a.wav", taken).name == "a_2.wav"
+    assert _unique_path(tmp_path, "a.wav", taken).name == "a_3.wav"
+    assert (tmp_path / "a.wav").read_bytes() == b"first"  # 永不覆盖
+
+
+def test_upload_single_file_creates_dataset(client):
+    payload = _wav_bytes()
+    resp = _upload(client, "alice", [("a.wav", payload)])
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["dataset"] == "alice"
+    assert body["created"] is True
+    assert body["added"] == ["a.wav"]
+    assert body["skipped"] == []
+    assert body["path"] == str(paths.DATASETS_DIR / "alice")
+    assert body["file_count"] == 1
+    assert body["total_duration"] > 0
+    on_disk = paths.DATASETS_DIR / "alice" / "a.wav"
+    assert on_disk.read_bytes() == payload  # 字节一致（流式落盘不改动内容）
+
+
+def test_upload_batch_multiple_files(client):
+    resp = _upload(
+        client,
+        "alice",
+        [("b.wav", _wav_bytes()), ("a.wav", _wav_bytes(seconds=2.0))],
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert sorted(body["added"]) == ["a.wav", "b.wav"]
+    assert body["file_count"] == 2
+    assert body["total_duration"] == pytest.approx(3.0, abs=0.2)
+    assert (paths.DATASETS_DIR / "alice" / "a.wav").is_file()
+
+
+def test_upload_duplicate_name_appends_sequence(client):
+    first, second = _wav_bytes(), _wav_bytes(seconds=2.0)
+    assert _upload(client, "alice", [("a.wav", first)]).status_code == 200
+
+    resp = _upload(client, "alice", [("a.wav", second)])
+    dataset = paths.DATASETS_DIR / "alice"
+
+    assert resp.status_code == 200
+    assert resp.json()["added"] == ["a_1.wav"]
+    assert (dataset / "a.wav").read_bytes() == first  # 原文件字节不变（永不覆盖）
+    assert (dataset / "a_1.wav").read_bytes() == second
+
+
+def test_upload_same_batch_duplicates_take_distinct_names(client):
+    resp = _upload(
+        client, "alice", [("a.wav", _wav_bytes())] * 3
+    )
+
+    assert resp.json()["added"] == ["a.wav", "a_1.wav", "a_2.wav"]
+    assert resp.json()["file_count"] == 3
+
+
+def test_upload_same_stem_different_suffix_coexist(client):
+    resp = _upload(client, "alice", [("a.wav", _wav_bytes()), ("a.mp3", _wav_bytes(seconds=2.0))])
+
+    assert sorted(resp.json()["added"]) == ["a.mp3", "a.wav"]
+
+
+def test_upload_preserves_unicode_and_space_filenames(client):
+    resp = _upload(client, "alice", [("中文 歌.wav", _wav_bytes()), ("🎉.wav", _wav_bytes())])
+
+    assert set(resp.json()["added"]) == {"🎉.wav", "中文 歌.wav"}
+    assert (paths.DATASETS_DIR / "alice" / "中文 歌.wav").is_file()
+
+
+def test_upload_non_audio_skipped_with_reason(client):
+    resp = _upload(client, "alice", [("a.wav", _wav_bytes()), ("notes.txt", b"hello")])
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["added"] == ["a.wav"]
+    assert len(body["skipped"]) == 1
+    assert body["skipped"][0]["name"] == "notes.txt"
+    assert ".txt" in body["skipped"][0]["reason"]  # reason 注明格式
+    assert not (paths.DATASETS_DIR / "alice" / "notes.txt").exists()
+
+
+def test_upload_empty_file_skipped(client):
+    resp = _upload(client, "alice", [("a.wav", b""), ("b.wav", _wav_bytes())])
+
+    body = resp.json()
+    assert body["added"] == ["b.wav"]
+    assert [s["name"] for s in body["skipped"]] == ["a.wav"]
+    assert not (paths.DATASETS_DIR / "alice" / "a.wav").exists()  # 空文件不落盘
+
+
+def test_upload_all_skipped_on_new_dataset_returns_400_without_dir(client):
+    resp = _upload(client, "fresh", [("notes.txt", b"x"), ("junk.exe", b"MZ")])
+
+    assert resp.status_code == 400
+    assert not (paths.DATASETS_DIR / "fresh").exists()  # 不留空目录
+    assert client.get("/api/datasets").json() == []
+
+
+def test_upload_all_skipped_on_existing_dataset_keeps_dir(client):
+    """对照：目录本就存在时全 skip 不是错误（追加零个文件），200 如实上报。"""
+    (paths.DATASETS_DIR / "alice").mkdir(parents=True)
+    resp = _upload(client, "alice", [("notes.txt", b"x")])
+
+    assert resp.status_code == 200
+    assert resp.json()["added"] == []
+    assert resp.json()["file_count"] == 0
+
+
+def test_upload_missing_files_field_returns_422(client):
+    resp = client.post("/api/datasets/alice/files", data={})
+
+    assert resp.status_code == 422  # FastAPI 对必填 File 字段缺省的默认行为
+
+
+def test_upload_invalid_dataset_name_returns_400(client):
+    resp = client.post(
+        "/api/datasets/%2E%2E/files", files=[("files", ("a.wav", _wav_bytes()))]
+    )
+
+    assert resp.status_code == 400
+
+
+def test_upload_oversize_file_aborts_with_413_no_partial(client, monkeypatch):
+    from server.api import datasets as datasets_api
+
+    monkeypatch.setattr(datasets_api, "MAX_FILE_BYTES", 16)
+    resp = _upload(client, "alice", [("a.wav", _wav_bytes())])
+
+    assert resp.status_code == 413
+    dataset = paths.DATASETS_DIR / "alice"
+    assert not (dataset / "a.wav").exists()  # 半成品已删
+    # 目录是本次新建且零落成 → 一并清掉（与全 skip 400 的「不留空目录」同一纪律）
+    assert not dataset.exists()
+    assert client.get("/api/datasets").json() == []
+
+
+def test_upload_batch_limit_keeps_completed_files(client, monkeypatch):
+    """累计超限：已完成的文件保留计入 added（不回滚），中止的文件不留半成品。"""
+    from server.api import datasets as datasets_api
+
+    a, b, c = _wav_bytes(), _wav_bytes(), _wav_bytes()
+    monkeypatch.setattr(datasets_api, "MAX_BATCH_BYTES", len(a) + 100)
+
+    resp = _upload(client, "alice", [("a.wav", a), ("b.wav", b), ("c.wav", c)])
+    dataset = paths.DATASETS_DIR / "alice"
+
+    assert resp.status_code == 413
+    assert (dataset / "a.wav").read_bytes() == a  # 已落盘的完整保留
+    assert not (dataset / "b.wav").exists()  # 写盘中止的半成品已删
+    assert not (dataset / "c.wav").exists()  # 中止后不再处理后续文件
+
+
+def test_upload_large_file_spools_to_disk(client):
+    """>1MB 的文件走 SpooledTemporaryFile 滚盘路径（不整体进内存），内容仍逐字节一致。"""
+    payload = _wav_bytes(seconds=60.0)
+    assert len(payload) > 1024 * 1024
+
+    resp = _upload(client, "alice", [("long.wav", payload)])
+
+    assert resp.status_code == 200
+    assert (paths.DATASETS_DIR / "alice" / "long.wav").read_bytes() == payload
+    assert resp.json()["total_duration"] == pytest.approx(60.0, abs=1.0)
+
+
+def test_upload_append_existing_dataset_counts_accumulate(client):
+    assert _upload(client, "alice", [("a.wav", _wav_bytes())]).status_code == 200
+
+    resp = _upload(client, "alice", [("b.wav", _wav_bytes(seconds=2.0))])
+    body = resp.json()
+
+    assert body["created"] is False
+    assert body["file_count"] == 2  # 追加后是数据集总数
+    assert body["total_duration"] == pytest.approx(3.0, abs=0.2)
+
+
+def test_upload_writes_sidecar_with_duration(client):
+    resp = _upload(client, "alice", [("a.wav", _wav_bytes(seconds=2.0))])
+    assert resp.status_code == 200
+
+    sidecar = json.loads(
+        (paths.DATASETS_DIR / ".meta" / "alice.json").read_text(encoding="utf8")
+    )
+    on_disk = paths.DATASETS_DIR / "alice" / "a.wav"
+    assert sidecar["a.wav"]["duration"] == pytest.approx(2.0, abs=0.1)
+    assert sidecar["a.wav"]["size"] == on_disk.stat().st_size
+    assert sidecar["a.wav"]["mtime_ns"] == on_disk.stat().st_mtime_ns
+
+
+def test_upload_io_failure_returns_500_with_progress(client, monkeypatch):
+    """落盘 IO 失败 → 500，detail 注明已成功写入的数量；已落盘文件保留。"""
+    real_open = Path.open
+
+    def flaky_open(self, mode="r", *args, **kwargs):
+        if self.name == "bad.wav" and "w" in mode:
+            raise OSError("disk full")
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", flaky_open)
+    good = _wav_bytes()
+
+    resp = _upload(client, "alice", [("good.wav", good), ("bad.wav", _wav_bytes())])
+    dataset = paths.DATASETS_DIR / "alice"
+
+    assert resp.status_code == 500
+    assert "1" in resp.json()["detail"]  # 已成功 N 个
+    assert (dataset / "good.wav").read_bytes() == good
+    assert not (dataset / "bad.wav").exists()  # 失败的半成品不留
 
 
 # ---------------------------------------------------------------------------
