@@ -113,10 +113,24 @@ else:
     )
 
 # Do not expose an unsupported CUDA device as the inference default.
-if infer_device.type != "cuda":
+# Allow override via RVC_DEVICE env var (e.g. RVC_DEVICE=cpu to force CPU).
+_forced_device = os.environ.get("RVC_DEVICE", "").lower()
+if _forced_device in ("cpu", "mps"):
+    infer_device, infer_dtype, infer_gpu_mem = (
+        torch.device(_forced_device),
+        torch.float32,
+        0.0,
+    )
+elif infer_device.type != "cuda":
     if DML_AVAILABLE:
         infer_device, infer_dtype, infer_gpu_mem = (
             DML_DEVICE,
+            torch.float32,
+            0.0,
+        )
+    elif torch.backends.mps.is_available():
+        infer_device, infer_dtype, infer_gpu_mem = (
+            torch.device("mps"),
             torch.float32,
             0.0,
         )
@@ -175,6 +189,8 @@ class Config:
         ) = self.arg_parse()
         # DML is an automatic fallback when no CUDA device satisfies the rule.
         self.dml = self.dml or (infer_device.type == "privateuseone")
+        # MPS is an automatic fallback when no CUDA/DML device is available (Apple Silicon).
+        self.mps = infer_device.type == "mps"
         self.instead = ""
         self.preprocess_per = 3.7
         self.x_pad, self.x_query, self.x_center, self.x_max = self.device_config()
@@ -240,6 +256,11 @@ class Config:
                 self.preprocess_per = 3.0
             if self.gpu_mem <= 4:
                 self.preprocess_per = 3.0
+        elif self.mps:
+            logger.info("Use Apple MPS (Metal Performance Shaders) instead")
+            self.device = str(infer_device)
+            self.dtype = torch.float32
+            self.is_half = False
         else:
             logger.info("No supported Nvidia GPU found")
             self.device = self.instead = "cpu"
