@@ -1,5 +1,6 @@
 """数据集 API 测试。全部用例把 paths.DATASETS_DIR monkeypatch 到 tmp_path 隔离：
 服务跑在 main 工作区、测试跑在 worktree，不共享真实 datasets/ 目录。"""
+import errno
 import io
 import json
 import os
@@ -647,6 +648,56 @@ def test_upload_io_failure_returns_500_with_progress(client, monkeypatch):
     assert "已成功写入 1 个文件" in resp.json()["detail"]
     assert (dataset / "good.wav").read_bytes() == good
     assert not (dataset / "bad.wav").exists()  # 失败的半成品不留
+
+
+def _patch_open_failure(monkeypatch, fail_on, code=errno.ENOSPC):
+    """在 O_EXCL 独占创建处注入 open 失败（fail_on 为第几个文件，1 起）。
+
+    只对落进数据集根的路径生效，避免误伤框架自身的临时文件创建。
+    """
+    real_open = os.open
+    seen = {"n": 0}
+
+    def flaky_open(path, flags, *args, **kwargs):
+        if str(path).startswith(str(paths.DATASETS_DIR)):
+            seen["n"] += 1
+            if seen["n"] == fail_on:
+                raise OSError(code, os.strerror(code))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", flaky_open)
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EACCES])
+def test_upload_open_failure_cleans_empty_new_dir(client, monkeypatch, code):
+    """os.open 非 EEXIST 失败（ENOSPC/EACCES）→ 与写盘失败同一收尾：500 + 空目录清理。
+
+    独占创建在写盘 try 块之内：EEXIST 之外的 OSError 不允许绕过
+    _discard_empty_new_dir 直接 500，否则本次新建的数据集目录会以空目录形态留在列表。
+    """
+    _patch_open_failure(monkeypatch, fail_on=1, code=code)
+
+    resp = _upload(client, "alice", [("a.wav", _wav_bytes())])
+    dataset = paths.DATASETS_DIR / "alice"
+
+    assert resp.status_code == 500
+    assert resp.json()["detail"] == "写入 a.wav 失败（已成功写入 0 个文件，已落盘文件保留）"
+    assert not dataset.exists()  # 本次新建且零落成 → 不留空目录
+    assert client.get("/api/datasets").json() == []
+
+
+def test_upload_open_failure_keeps_completed_files(client, monkeypatch):
+    """第 2 个文件 open 失败：已落盘的第 1 个保留、失败项不留空壳（与写盘失败对齐）。"""
+    _patch_open_failure(monkeypatch, fail_on=2)
+    good = _wav_bytes()
+
+    resp = _upload(client, "alice", [("good.wav", good), ("bad.wav", _wav_bytes())])
+    dataset = paths.DATASETS_DIR / "alice"
+
+    assert resp.status_code == 500
+    assert "已成功写入 1 个文件" in resp.json()["detail"]
+    assert (dataset / "good.wav").read_bytes() == good
+    assert not (dataset / "bad.wav").exists()
 
 
 # ---------------------------------------------------------------------------

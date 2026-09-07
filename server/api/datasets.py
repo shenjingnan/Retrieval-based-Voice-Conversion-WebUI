@@ -406,16 +406,18 @@ def upload_dataset_files(
             skipped.append({"name": safe, "reason": "空文件（0 字节）"})
             continue
 
-        while True:
-            # O_EXCL 独占创建：exists() 检查与 open 之间的窗口（线程池并发上传同名
-            # 文件）由文件系统裁决，被占即换名重试，绝不覆盖
-            target = _unique_path(directory, safe, taken)
-            try:
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-                break
-            except FileExistsError:
-                taken.add(target.name)
         try:
+            while True:
+                # O_EXCL 独占创建：exists() 检查与 open 之间的窗口（线程池并发上传同名
+                # 文件）由文件系统裁决，被占即换名重试，绝不覆盖。循环放在下面的
+                # except OSError 收尾范围内：os.open 除 EEXIST 重试外还可能直接失败
+                # （ENOSPC/EACCES…），必须与写盘失败走同一条 500 + 空目录清理路径
+                target = _unique_path(directory, safe, taken)
+                try:
+                    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                    break
+                except FileExistsError:
+                    taken.add(target.name)
             written = _save_stream(
                 upload, target, fd, MAX_FILE_BYTES, MAX_BATCH_BYTES - batch_written
             )
