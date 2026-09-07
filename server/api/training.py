@@ -104,7 +104,8 @@ class PipelineBody(FitBody):
 
 
 # 命令串按双引号包裹路径，这些字符会破坏参数边界（注入面），实验名额外拒绝空白字符；
-# $ 与反引号会触发命令替换（实验名出现在 -e "..." 与日志路径里，一并拒绝）
+# $ 与反引号会触发命令替换（实验名出现在 -e "..." 与日志路径里，一并拒绝）。
+# server.api.datasets._check_name 复用同一张表（数据集名与实验名同规则），改动须两侧同步
 _EXP_FORBIDDEN = ' \t\r\n"\\$`'
 _F0_METHODS = frozenset({"pm", "rmvpe"})
 _VERSIONS = frozenset({"v1", "v2"})
