@@ -114,9 +114,12 @@ _SR_KEYS = frozenset(SR_DICT)
 
 def _check_exp_name(value: str) -> str:
     """非空、无路径分量（防穿越）、无引号/反斜杠/空白（防 shell 注入）。
-    "." 与 ".." 单独拒绝：Python 3.13 起 Path("..").name 返回 ".."，不再能靠 name 兜住。"""
+    "." 与 ".." 单独拒绝：Python 3.13 起 Path("..").name 返回 ".."，不再能靠 name 兜住。
+    NUL 单独拒绝：漏到任务编排层（mkdir/日志路径）是 ValueError → 500，必须在 400
+    拦下（与 server.api.datasets._check_name 同步补的判定，两侧同步）。"""
     if (
         not value
+        or "\0" in value
         or value in (".", "..")
         or Path(value).name != value
         or any(ch in _EXP_FORBIDDEN for ch in value)

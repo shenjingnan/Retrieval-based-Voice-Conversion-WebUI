@@ -12,9 +12,10 @@ import json
 import logging
 import os
 import shutil
+import threading
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
 from server import paths
 # 与 training._check_exp_name 同源的非法字符表（勿在本模块复制一份，改一处必须同源）
@@ -47,9 +48,11 @@ CHUNK_BYTES = 1024 * 1024
 def _check_name(value: str) -> str:
     """数据集名沿用实验名同源规则（training._check_exp_name 的语义：防路径穿越 + 防
     shell 注入，非法字符表即 _EXP_FORBIDDEN），另拒前导点：.meta 侧车目录与隐藏目录
-    不能被当成数据集访问（否则列表/删除会误伤缓存）。"""
+    不能被当成数据集访问（否则列表/删除会误伤缓存）。NUL 单独拒绝：漏到 mkdir/unlink
+    层是 ValueError → 500，必须先在 400 拦下（training 侧已加同一判定，两侧同步）。"""
     if (
         not value
+        or "\0" in value
         or value.startswith(".")
         or Path(value).name != value
         or any(ch in _EXP_FORBIDDEN for ch in value)
@@ -107,10 +110,12 @@ def _safe_filename(name: str) -> str:
 
 
 def _unique_path(directory: Path, filename: str, taken: set) -> Path:
-    """目录内不重名的落盘路径：重名 → stem_1.ext 递增。
+    """目录内不重名的落盘候选路径：重名 → stem_1.ext 递增。
 
     taken 是本批次已分配的名字——同批两份 a.wav 落盘前谁也不 exists()，必须靠集合
-    防互撞；磁盘已有文件（无论是不是音频）也一律视为占用。永不覆盖用户数据。
+    防互撞；磁盘已有文件（无论是不是音频）也一律视为占用。这里只负责「挑一个大概率
+    可用的名字」；真正的「永不覆盖」由调用方的 O_EXCL 独占创建裁决——exists() 检查
+    与 open 之间存在窗口（sync handler 在线程池，两个并发上传可同时通过检查）。
     """
     candidate = directory / filename
     if candidate.name in taken or candidate.exists():
@@ -123,17 +128,18 @@ def _unique_path(directory: Path, filename: str, taken: set) -> Path:
     return candidate
 
 
-def _save_stream(upload: UploadFile, target: Path, file_limit: int, batch_budget: int) -> int:
-    """把上传文件的 spool 流式写到 target，返回写入字节数。
+def _save_stream(upload: UploadFile, target: Path, fd: int, file_limit: int, batch_budget: int) -> int:
+    """把上传文件的 spool 流式写到已独占创建的 fd，返回写入字节数。
 
-    读一块写一块（CHUNK_BYTES 粒度），写盘中即时核对两条限额：file_limit 为单文件
-    上限，batch_budget 为本批剩余额度（累计上限 − 已落盘字节数）——大小限制是软限制，
-    不信 Content-Length、不预读整个流，超限即刻中止。任何异常路径都先删掉半成品再
-    上抛：磁盘上只允许出现完整文件。
+    「超限中止」针对落盘到数据集目录的字节：请求 body 已由框架在 handler 之前整体
+    spool 进 $TMPDIR（声明的体积由 handler 入口的 Content-Length 预检挡下，谎报的
+    小体积大 body 由这里兜底）。读一块写一块（CHUNK_BYTES 粒度），写盘中即时核对
+    两条限额：file_limit 为单文件上限，batch_budget 为本批剩余额度（累计上限 − 已
+    落盘字节数）。任何异常路径都先删掉半成品再上抛：磁盘上只允许出现完整文件。
     """
     written = 0
     try:
-        with target.open("wb") as out:
+        with os.fdopen(fd, "wb") as out:
             while chunk := upload.file.read(CHUNK_BYTES):
                 written += len(chunk)
                 if written > file_limit:
@@ -142,6 +148,10 @@ def _save_stream(upload: UploadFile, target: Path, file_limit: int, batch_budget
                     raise _QuotaExceeded("超过单次上传的累计大小上限", batch_budget)
                 out.write(chunk)
     except BaseException:  # noqa: BLE001 半成品清理必须覆盖 413 与 IO 错误两条路径
+        # 两个清理动作各自 suppress：正常退出路径 fd 已随 with 关闭，close 必抛 EBADF，
+        # 与 unlink 混在同一个 suppress 里会把半成品清理整个跳过
+        with contextlib.suppress(OSError):
+            os.close(fd)  # fdopen 失败时防 fd 泄漏；正常路径 EBADF 被抑制
         with contextlib.suppress(OSError):
             target.unlink(missing_ok=True)
         raise
@@ -206,11 +216,13 @@ def _cache_load(name: str) -> dict:
 
 
 def _cache_store(name: str, cache: dict) -> None:
-    """原子写（tmp + os.replace）；写失败静默——缓存只影响探测耗时，不影响正确性。"""
+    """原子写（tmp + os.replace）；写失败静默——缓存只影响探测耗时，不影响正确性。
+    tmp 名掺 pid + 线程 id：sync handler 在线程池，两个请求同时写同一数据集的侧车时
+    不能共用一个 tmp 名（后写者会把先写者尚未 replace 的半成品抢走发布）。"""
     meta_dir = paths.DATASETS_DIR / META_DIRNAME
     try:
         meta_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = meta_dir / f"{name}.json.tmp"
+        tmp_path = meta_dir / f"{name}.json.{os.getpid()}.{threading.get_ident()}.tmp"
         tmp_path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf8")
         os.replace(tmp_path, meta_dir / f"{name}.json")
     except OSError:
@@ -291,7 +303,13 @@ def list_datasets():
         ),
         key=lambda entry: entry.name,
     )
-    return [_scan_dataset(entry)[0] for entry in entries]
+    summaries = []
+    for entry in entries:
+        with contextlib.suppress(OSError):
+            # 并发删除的竞态（扫描到一半目录消失）只影响该数据集，跳过即可，
+            # 不让整个列表 500
+            summaries.append(_scan_dataset(entry)[0])
+    return summaries
 
 
 @router.get("/{name}")
@@ -300,24 +318,44 @@ def dataset_detail(name: str):
     directory = _dataset_dir(name)
     if not directory.is_dir():
         raise HTTPException(404, "数据集不存在：%s" % name)
-    summary, files = _scan_dataset(directory)
+    try:
+        summary, files = _scan_dataset(directory)
+    except OSError:
+        # 404 检查之后、扫描过程中被并发删除：如实按不存在处理
+        raise HTTPException(404, "数据集不存在：%s" % name)
     summary["files"] = files
     return summary
 
 
 @router.post("/{name}/files")
-def upload_dataset_files(name: str, files: list[UploadFile] = File(...)):
+def upload_dataset_files(
+    name: str, request: Request, files: list[UploadFile] = File(...)
+):
     """上传音频（multipart `files`，浏览器可多选/拖拽）：目录不存在则建、存在则追加。
 
     必须用 list[UploadFile]（SpooledTemporaryFile 流式，>1MB 滚到磁盘临时文件），不可
-    换成 `bytes = File(...)` 的全量内存模式。逐文件：名字可安全化 → 后缀是音频 → 非
-    0 字节 → 取不重名路径 → 流式落盘 → 探测时长写侧车。大小限制是软限制：写盘中计数、
-    即时中止、半成品删除；已完成的文件保留计入 added（不回滚），所以 413 之后磁盘上
-    可能已有本次的部分文件。全 skip 且目录是本次新建 → 400 并删掉刚建的空目录。
+    换成 `bytes = File(...)` 的全量内存模式。逐文件：名字可安全化 → 非点开头 → 后缀是
+    音频 → 非 0 字节 → 独占创建不重名路径 → 流式落盘 → 探测时长写侧车。大小限制是软
+    限制：写盘中计数、即时中止、半成品删除；已完成的文件保留计入 added（不回滚），
+    所以 413 之后磁盘上可能已有本次的部分文件。全 skip 且目录是本次新建 → 400 并删掉
+    刚建的空目录。
     """
     directory = _dataset_dir(name)  # 非法名 → 400
     if not files:
         raise HTTPException(400, "未选择任何文件")
+    # Content-Length 预检：body 由框架在 handler 之前整体 spool 进 $TMPDIR，超大 body
+    # 会先写满临时目录并阻塞接收——软限制防不住 body 本体。该头由客户端声明、可以谎报，
+    # 只做便宜的预检（缺失或非数字则跳过，交由写盘中计数兜底）；余量容掉 multipart
+    # 边界的编码开销。
+    declared = request.headers.get("content-length")
+    if (
+        declared
+        and declared.isdigit()
+        and int(declared) > MAX_BATCH_BYTES + CHUNK_BYTES
+    ):
+        raise HTTPException(
+            413, "上传体积超过单次累计上限（%d MB）" % (MAX_BATCH_BYTES // (1024 * 1024))
+        )
     created = not directory.is_dir()
     if created:
         try:
@@ -346,6 +384,14 @@ def upload_dataset_files(name: str, files: list[UploadFile] = File(...)):
         if not safe:
             skipped.append({"name": original, "reason": "文件名为空"})
             continue
+        if safe.startswith("."):
+            # 与 _iter_audio 的隐藏文件口径一致：点开头文件即使落盘也进不了列表/详情，
+            # preprocess 还会把它当音频解一次（macOS 复制出的 AppleDouble ._a.wav 是
+            # 真实场景）——与其自相矛盾不如直接 skip
+            skipped.append(
+                {"name": safe, "reason": "点开头的文件不会出现在数据集列表中，已跳过"}
+            )
+            continue
         suffix = Path(safe).suffix.lower()
         if suffix not in AUDIO_SUFFIXES:
             supported = " ".join(sorted(AUDIO_SUFFIXES))
@@ -360,10 +406,18 @@ def upload_dataset_files(name: str, files: list[UploadFile] = File(...)):
             skipped.append({"name": safe, "reason": "空文件（0 字节）"})
             continue
 
-        target = _unique_path(directory, safe, taken)
+        while True:
+            # O_EXCL 独占创建：exists() 检查与 open 之间的窗口（线程池并发上传同名
+            # 文件）由文件系统裁决，被占即换名重试，绝不覆盖
+            target = _unique_path(directory, safe, taken)
+            try:
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                break
+            except FileExistsError:
+                taken.add(target.name)
         try:
             written = _save_stream(
-                upload, target, MAX_FILE_BYTES, MAX_BATCH_BYTES - batch_written
+                upload, target, fd, MAX_FILE_BYTES, MAX_BATCH_BYTES - batch_written
             )
         except _QuotaExceeded as exc:
             _discard_empty_new_dir()

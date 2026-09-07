@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -77,6 +78,9 @@ def test_routes_registered_in_openapi():
     schema = create_app().openapi()
     assert "/api/datasets" in schema["paths"]
     assert "/api/datasets/{name}" in schema["paths"]
+    assert "/api/datasets/{name}/files" in schema["paths"]
+    assert "post" in schema["paths"]["/api/datasets/{name}/files"]
+    assert "delete" in schema["paths"]["/api/datasets/{name}"]
 
 
 # ---------------------------------------------------------------------------
@@ -84,9 +88,10 @@ def test_routes_registered_in_openapi():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", ["../x", ".", "..", "a b", "a$b", 'a"b', ".meta"])
+@pytest.mark.parametrize("bad", ["../x", ".", "..", "a b", "a$b", 'a"b', ".meta", "a\0b"])
 def test_check_name_rejects_forbidden(bad):
-    """防穿越（../x、.、..）+ 防 shell 注入（空格、$、引号）+ 拒前导点（.meta 伪装）。"""
+    """防穿越（../x、.、..）+ 防 shell 注入（空格、$、引号）+ 拒前导点（.meta 伪装）
+    + 拒 NUL（漏到 mkdir/unlink 层是 ValueError → 500，必须在 400 拦下）。"""
     with pytest.raises(HTTPException) as excinfo:
         _check_name(bad)
     assert excinfo.value.status_code == 400
@@ -178,6 +183,40 @@ def test_total_duration_aggregates_rest_when_one_probe_fails(client):
     files = {f["name"]: f["duration"] for f in client.get("/api/datasets/alice").json()["files"]}
     assert files["broken.wav"] is None
     assert files["good.wav"] == pytest.approx(1.0, abs=0.1)
+
+
+def test_list_tolerates_dataset_deleted_mid_scan(client, monkeypatch):
+    """并发删除的竞态（扫描到一半目录消失）：跳过该项，不 500 整次列表。"""
+    root = paths.DATASETS_DIR
+    _write_wav(root / "alice" / "a.wav")
+    _write_wav(root / "bob" / "b.wav")
+
+    from server.api import datasets as datasets_api
+
+    real_scan = datasets_api._scan_dataset
+
+    def flaky_scan(directory):
+        if directory.name == "alice":
+            raise FileNotFoundError(directory)  # 模拟 listdir/stat 时目录已被并发删掉
+        return real_scan(directory)
+
+    monkeypatch.setattr(datasets_api, "_scan_dataset", flaky_scan)
+    data = client.get("/api/datasets").json()
+
+    assert [d["name"] for d in data] == ["bob"]
+
+
+def test_detail_tolerates_dataset_deleted_mid_scan(client, monkeypatch):
+    """404 检查之后、扫描过程中被并发删除 → 如实按不存在处理，不 500。"""
+    _write_wav(paths.DATASETS_DIR / "alice" / "a.wav")
+
+    from server.api import datasets as datasets_api
+
+    def gone_scan(directory):
+        raise FileNotFoundError(directory)
+
+    monkeypatch.setattr(datasets_api, "_scan_dataset", gone_scan)
+    assert client.get("/api/datasets/alice").status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +438,90 @@ def test_upload_empty_file_skipped(client):
     assert not (paths.DATASETS_DIR / "alice" / "a.wav").exists()  # 空文件不落盘
 
 
+def test_upload_dot_prefixed_filename_skipped(client):
+    """点开头文件（AppleDouble 的 ._a.wav 是真实场景）落盘也进不了列表（_iter_audio
+    的隐藏文件口径），preprocess 还会把它当音频解一次——直接 skip，不自相矛盾。"""
+    resp = _upload(
+        client, "alice", [("._hidden.wav", _wav_bytes()), ("a.wav", _wav_bytes())]
+    )
+
+    body = resp.json()
+    assert body["added"] == ["a.wav"]
+    assert [s["name"] for s in body["skipped"]] == ["._hidden.wav"]
+    assert not (paths.DATASETS_DIR / "alice" / "._hidden.wav").exists()
+
+
+def test_upload_rejects_oversize_declared_body(client):
+    """Content-Length 预检：body 由框架在 handler 之前整体 spool 进 $TMPDIR，超大声明
+    直接 413，不进落盘流程（连目录都不建）。"""
+    from server.api.datasets import MAX_BATCH_BYTES
+
+    resp = client.post(
+        "/api/datasets/alice/files",
+        files=[("files", ("a.wav", _wav_bytes()))],
+        headers={"content-length": str(MAX_BATCH_BYTES + 1024 * 1024 + 1)},
+    )
+
+    assert resp.status_code == 413
+    assert not (paths.DATASETS_DIR / "alice").exists()
+
+
+def test_upload_race_between_check_and_create_gets_own_file(client, monkeypatch):
+    """exists() 检查与真正 open 之间存在窗口（线程池并发上传），落盘用 O_EXCL 独占
+    创建把「永不覆盖」交给文件系统裁决：窗口内路径被占 → 换名，绝不覆盖。stub 在
+    _unique_path 返回后、独占创建前把目标路径占掉，确定性复现这个窗口。"""
+    from server.api import datasets as datasets_api
+
+    dataset = paths.DATASETS_DIR / "alice"
+    real_unique = datasets_api._unique_path
+    injected = {"done": False}
+
+    def unique_then_rival(directory, filename, taken):
+        target = real_unique(directory, filename, taken)
+        if not injected["done"]:
+            injected["done"] = True
+            target.write_bytes(b"rival got here first")  # 竞态对手抢先落位
+        return target
+
+    monkeypatch.setattr(datasets_api, "_unique_path", unique_then_rival)
+    payload = _wav_bytes(seconds=2.0)
+
+    resp = _upload(client, "alice", [("same.wav", payload)])
+
+    assert resp.status_code == 200
+    assert resp.json()["added"] == ["same_1.wav"]  # 换名，不覆盖对手
+    assert (dataset / "same.wav").read_bytes() == b"rival got here first"
+    assert (dataset / "same_1.wav").read_bytes() == payload
+
+
+def test_upload_concurrent_same_name_never_overwrites():
+    """真并发：两线程各传同名文件，两个文件都在且字节完好（各归各的路径）。"""
+    payload_a, payload_b = _wav_bytes(seconds=8.0), _wav_bytes(seconds=16.0)
+    barrier = threading.Barrier(2, timeout=60)
+    results = {}
+
+    def run(tag, payload):
+        with TestClient(create_app()) as per_thread_client:
+            barrier.wait()  # 两侧同时进入请求，最大化撞窗概率
+            results[tag] = _upload(per_thread_client, "alice", [("same.wav", payload)])
+
+    threads = [
+        threading.Thread(target=run, args=("a", payload_a)),
+        threading.Thread(target=run, args=("b", payload_b)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+
+    assert sorted(r.status_code for r in results.values()) == [200, 200]
+    dataset = paths.DATASETS_DIR / "alice"
+    names = sorted(p.name for p in dataset.iterdir())
+    assert names == ["same.wav", "same_1.wav"]
+    sizes = sorted((dataset / name).stat().st_size for name in names)
+    assert sizes == sorted([len(payload_a), len(payload_b)])  # 两份字节都完好
+
+
 def test_upload_all_skipped_on_new_dataset_returns_400_without_dir(client):
     resp = _upload(client, "fresh", [("notes.txt", b"x"), ("junk.exe", b"MZ")])
 
@@ -498,22 +621,30 @@ def test_upload_writes_sidecar_with_duration(client):
 
 
 def test_upload_io_failure_returns_500_with_progress(client, monkeypatch):
-    """落盘 IO 失败 → 500，detail 注明已成功写入的数量；已落盘文件保留。"""
-    real_open = Path.open
+    """落盘 IO 失败 → 500，detail 注明已成功写入的数量；已落盘文件保留。
 
-    def flaky_open(self, mode="r", *args, **kwargs):
-        if self.name == "bad.wav" and "w" in mode:
-            raise OSError("disk full")
-        return real_open(self, mode, *args, **kwargs)
+    落盘句柄由 O_EXCL 独占创建产生、经 os.fdopen 接管，打桩点在 fdopen（第 2 个文件
+    即失败）；fd 先 close 再抛，模拟打开即失败，顺带覆盖 except 里的防 fd 泄漏分支。
+    """
+    real_fdopen = os.fdopen
+    seen = {"w": 0}
 
-    monkeypatch.setattr(Path, "open", flaky_open)
+    def flaky_fdopen(fd, mode="r", *args, **kwargs):
+        if "w" in mode:
+            seen["w"] += 1
+            if seen["w"] == 2:  # 第 2 个文件（bad.wav）
+                os.close(fd)
+                raise OSError("disk full")
+        return real_fdopen(fd, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fdopen", flaky_fdopen)
     good = _wav_bytes()
 
     resp = _upload(client, "alice", [("good.wav", good), ("bad.wav", _wav_bytes())])
     dataset = paths.DATASETS_DIR / "alice"
 
     assert resp.status_code == 500
-    assert "1" in resp.json()["detail"]  # 已成功 N 个
+    assert "已成功写入 1 个文件" in resp.json()["detail"]
     assert (dataset / "good.wav").read_bytes() == good
     assert not (dataset / "bad.wav").exists()  # 失败的半成品不留
 
@@ -700,17 +831,32 @@ def _encode_compressed(path, codec, seconds=3.0, rate=44100):
     return path
 
 
+def _encoder_available(codec: str) -> bool:
+    """PyAV 的非 wheel 构建可能缺 AAC/lame 编码器：缺则跳过对应用例（探测主路本身
+    由其余用例与兜底路径覆盖）。收集期求值，av 顶层导入无 torch 依赖，安全。"""
+    import av
+
+    try:
+        av.codec.Codec(codec, "w")
+        return True
+    except Exception:  # noqa: BLE001 未知编码器在 av 里以 ValueError/UnknownCodecError 表达
+        return False
+
+
+@pytest.mark.skipif(not _encoder_available("aac"), reason="PyAV 构建无 AAC 编码器")
 def test_audio_duration_m4a_aac_from_primary_path(tmp_path):
     """AAC（m4a）：libsndfile 读不了，时长必须由 PyAV 主路给出（实测误差 ~0.02s）。"""
     path = _encode_compressed(tmp_path / "a.m4a", "aac")
     assert _audio_duration(path) == pytest.approx(3.0, abs=0.2)
 
 
+@pytest.mark.skipif(not _encoder_available("libmp3lame"), reason="PyAV 构建无 lame 编码器")
 def test_audio_duration_mp3_compressed(tmp_path):
     path = _encode_compressed(tmp_path / "a.mp3", "libmp3lame")
     assert _audio_duration(path) == pytest.approx(3.0, abs=0.3)
 
 
+@pytest.mark.skipif(not _encoder_available("libmp3lame"), reason="PyAV 构建无 lame 编码器")
 def test_audio_duration_truncated_mp3_never_raises(tmp_path):
     """截断的压缩文件（元数据/帧流不完整）：探测失败走兜底，绝不向调用方抛异常。"""
     full = _encode_compressed(tmp_path / "full.mp3", "libmp3lame")
