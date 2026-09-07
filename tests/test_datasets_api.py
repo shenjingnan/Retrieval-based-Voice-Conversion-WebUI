@@ -671,3 +671,52 @@ def test_audio_duration_text_file_returns_none(tmp_path):
     path = tmp_path / "fake.wav"
     path.write_text("这不是音频", encoding="utf-8")
     assert _audio_duration(path) is None
+
+
+def _encode_compressed(path, codec, seconds=3.0, rate=44100):
+    """用 av 现场编码压缩音频（AAC→m4a / libmp3lame→mp3），不引入二进制 fixture。
+
+    wav 用哪条探测路都绿，暴露不了主路的真实行为——soundfile 读不了 AAC（libsndfile
+    不支持），m4a 用例是「PyAV 主路真正生效」的唯一证明；这类用例缺失正是上一版
+    frames/average_rate 写法失效却全绿的原因。
+    """
+    import av
+
+    samples = int(rate * seconds)
+    tone = (0.3 * np.sin(2 * np.pi * 440 * (np.arange(samples) / rate))).astype("float32")
+    step = 1024 if codec == "aac" else 1152  # AAC/MP3 每帧采样数
+    with av.open(str(path), "w") as out:  # 容器格式按后缀推断
+        stream = out.add_stream(codec, rate=rate)
+        for off in range(0, samples, step):
+            chunk = tone[off : off + step]
+            frame = av.AudioFrame.from_ndarray(
+                np.stack([chunk, chunk]), format="fltp", layout="stereo"
+            )
+            frame.sample_rate = rate
+            for packet in stream.encode(frame):
+                out.mux(packet)
+        for packet in stream.encode(None):
+            out.mux(packet)
+    return path
+
+
+def test_audio_duration_m4a_aac_from_primary_path(tmp_path):
+    """AAC（m4a）：libsndfile 读不了，时长必须由 PyAV 主路给出（实测误差 ~0.02s）。"""
+    path = _encode_compressed(tmp_path / "a.m4a", "aac")
+    assert _audio_duration(path) == pytest.approx(3.0, abs=0.2)
+
+
+def test_audio_duration_mp3_compressed(tmp_path):
+    path = _encode_compressed(tmp_path / "a.mp3", "libmp3lame")
+    assert _audio_duration(path) == pytest.approx(3.0, abs=0.3)
+
+
+def test_audio_duration_truncated_mp3_never_raises(tmp_path):
+    """截断的压缩文件（元数据/帧流不完整）：探测失败走兜底，绝不向调用方抛异常。"""
+    full = _encode_compressed(tmp_path / "full.mp3", "libmp3lame")
+    broken = tmp_path / "broken.mp3"
+    broken.write_bytes(full.read_bytes()[: full.stat().st_size // 3])
+
+    result = _audio_duration(broken)
+
+    assert result is None or isinstance(result, float)

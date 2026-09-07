@@ -163,18 +163,19 @@ def _probe_spool_size(upload: UploadFile) -> int:
 
 
 def _audio_duration(path: Path) -> float | None:
-    """音频时长（秒）。PyAV 取音频流 frames/average_rate——container.duration 在 mp3 上
-    偏大 5-8%，不可用；PyAV 读不出（格式不支持 / 损坏 / 未装 av）走 soundfile 的
-    sf.info 兜底；两路都失败返回 None。绝不向调用方抛异常。"""
+    """音频时长（秒）。PyAV 主路取音频流 duration×time_base——不取 container.duration
+    （mp3 容器时长偏大 5-8%），也不取 frames/average_rate（frames 在 wav/mp3 等格式上
+    恒为 0，AudioStream 更没有 average_rate 属性——旧写法是永不生效的死代码，av 15.1.0
+    实测）；m4a（AAC）libsndfile 读不了、只能靠这条主路给出时长。PyAV 读不出（格式
+    不支持 / 损坏 / 未装 av）走 soundfile 的 sf.info 兜底；两路都失败返回 None。绝不向
+    调用方抛异常。"""
     try:
         import av
 
         with av.open(str(path)) as container:
             stream = container.streams.audio[0]
-            frames = stream.frames
-            rate = stream.average_rate
-            if frames and rate:
-                return float(frames) / float(rate)
+            if stream.duration is not None and stream.time_base:
+                return float(stream.duration * stream.time_base)
     except Exception:  # noqa: BLE001 探测失败属预期分支，交给 soundfile 兜底
         logger.debug("PyAV 时长探测失败：%s", path, exc_info=True)
     try:
