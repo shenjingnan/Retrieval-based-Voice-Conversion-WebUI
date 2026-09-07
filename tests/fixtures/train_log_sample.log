@@ -1,0 +1,5 @@
+训练轮次：20 [34%]
+[1234, 0.0001]
+loss_disc=12.345, loss_gen=23.456, loss_fm=1.234,loss_mel=45.678, loss_kl=0.912
+Epoch: 20 [34%]
+INFO:train.train:Saving model and optimizer state at epoch 20

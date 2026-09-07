@@ -1,1 +1,8 @@
+# worktree 目录
 .worktrees/
+
+# 构建产物与本地运行时产物
+__pycache__/
+*.pyc
+.pytest_cache/
+server/static/
