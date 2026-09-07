@@ -6,3 +6,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 server/static/
+TEMP/
+
+# 下载型模型资产与训练产物（README 指引下载/训练生成，不入库）
+assets/
+logs/
+.model-downloads/
