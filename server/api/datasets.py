@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
@@ -18,6 +19,9 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from server import paths
 # 与 training._check_exp_name 同源的非法字符表（勿在本模块复制一份，改一处必须同源）
 from server.api.training import _EXP_FORBIDDEN
+# 删除互斥的判定依据：任务状态机常量与进程级任务表单例（server.tasks 顶层不加载
+# torch，与 server.main 的导入深度一致，pytest 收集期安全）
+from server.tasks import TERMINAL_STATES, task_manager
 
 logger = logging.getLogger(__name__)
 
@@ -405,3 +409,63 @@ def upload_dataset_files(name: str, files: list[UploadFile] = File(...)):
         "file_count": summary["file_count"],
         "total_duration": summary["total_duration"],
     }
+
+
+def _rmtree_best_effort(directory: Path, failed_files: list) -> None:
+    """尽力删除目录树：逐项失败不中断，残留文件名收进 failed_files。
+
+    目录自身的失败（顶层扫描被拒 / 最终 rmdir 因残留非空）不进 failed_files——那不
+    是文件级信息，由调用方以「目录是否还在」做整体判定。onexc 是 3.12+ 参数，
+    onerror 是等价旧签名（回调末参 excinfo 换成 exc，这里用不到），按版本回退。
+    """
+    def on_error(_func, path, exc) -> None:
+        if Path(path) != directory:
+            failed_files.append(Path(path).name)
+        logger.warning("删除数据集目录时无法移除 %s：%r", path, exc)
+
+    try:
+        shutil.rmtree(directory, onexc=on_error)
+    except TypeError:  # Python < 3.12 没有 onexc
+        shutil.rmtree(directory, onerror=lambda func, path, excinfo: on_error(func, path, excinfo))
+
+
+@router.delete("/{name}")
+def delete_dataset(name: str):
+    """删除数据集目录与侧车。训练任务非终态时 409 拒删——不解析 cmds 是否引用该
+    数据集，宁可误拦（用户可停任务后重试），也不冒删掉正在被读的目录的风险。
+
+    删除是尽力而为：单个文件删不掉（占用/权限）不回滚也不 500，残留项进
+    failed_files 如实上报（models.delete_model 同纪律）；目录整体无法推进且无
+    逐项失败可报时才 500。
+    """
+    directory = _dataset_dir(name)  # 非法名 → 400
+    if not directory.is_dir():
+        raise HTTPException(404, "数据集不存在：%s" % name)
+    active = [
+        task for task in task_manager.list_tasks() if task["state"] not in TERMINAL_STATES
+    ]
+    if active:
+        raise HTTPException(
+            409,
+            "训练任务进行中（%s），不能删除数据集 %s；请先停止或等待任务完成"
+            % (active[0]["name"], name),
+        )
+
+    failed_files: list = []
+    try:
+        _rmtree_best_effort(directory, failed_files)
+    except OSError:
+        logger.exception("数据集目录删除失败：%s", directory)
+        raise HTTPException(500, "数据集目录删除失败：%s" % name)
+
+    if directory.exists():
+        if failed_files:
+            # 部分失败：删掉的已删掉、残留项如实上报，不回滚
+            return {"deleted": False, "failed_files": failed_files}
+        raise HTTPException(500, "数据集目录无法移除：%s" % name)
+
+    # 侧车一起删（只是缓存，失败静默——残留侧车不会被任何路径读到）
+    with contextlib.suppress(OSError):
+        (paths.DATASETS_DIR / META_DIRNAME / f"{name}.json").unlink(missing_ok=True)
+
+    return {"deleted": True, "failed_files": []}

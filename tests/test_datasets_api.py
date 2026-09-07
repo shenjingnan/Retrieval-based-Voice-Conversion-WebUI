@@ -519,6 +519,119 @@ def test_upload_io_failure_returns_500_with_progress(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 删除：尽力删 + 训练任务互斥
+# ---------------------------------------------------------------------------
+
+
+def test_delete_dataset_removes_dir_and_sidecar(client):
+    dataset = paths.DATASETS_DIR / "alice"
+    _write_wav(dataset / "a.wav")
+    client.get("/api/datasets")  # 顺带生成侧车
+    assert (paths.DATASETS_DIR / ".meta" / "alice.json").is_file()
+
+    resp = client.delete("/api/datasets/alice")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": True, "failed_files": []}
+    assert not dataset.exists()
+    assert not (paths.DATASETS_DIR / ".meta" / "alice.json").exists()  # 侧车一并删除
+
+
+def test_delete_missing_dataset_returns_404(client):
+    assert client.delete("/api/datasets/ghost").status_code == 404
+
+
+@pytest.mark.parametrize("encoded", ["%2E%2E", "%2E"])
+def test_delete_traversal_encoded_names_rejected(client, encoded):
+    """编码后的 `..` / `.` 到不了目录层（_check_name 400），与 GET 详情同源防线。"""
+    assert client.delete("/api/datasets/" + encoded).status_code == 400
+
+
+def test_delete_blocked_while_task_active(client, monkeypatch):
+    dataset = paths.DATASETS_DIR / "alice"
+    _write_wav(dataset / "a.wav")
+
+    from server.api import datasets as datasets_api
+
+    def fake_list_tasks():
+        return [{"id": "t1", "name": "exp_a", "state": "running"}]
+
+    monkeypatch.setattr(datasets_api.task_manager, "list_tasks", fake_list_tasks)
+
+    resp = client.delete("/api/datasets/alice")
+
+    assert resp.status_code == 409
+    assert "exp_a" in resp.json()["detail"]
+    assert dataset.exists()  # 互斥拦截：目录原样保留
+
+
+def test_delete_allowed_when_tasks_are_terminal(client, monkeypatch):
+    """保守判定只拦非终态：历史终态任务（success/failed）不构成互斥。"""
+    dataset = paths.DATASETS_DIR / "alice"
+    _write_wav(dataset / "a.wav")
+
+    from server.api import datasets as datasets_api
+
+    monkeypatch.setattr(
+        datasets_api.task_manager,
+        "list_tasks",
+        lambda: [
+            {"id": "t1", "name": "old", "state": "success"},
+            {"id": "t2", "name": "new", "state": "failed"},
+        ],
+    )
+
+    resp = client.delete("/api/datasets/alice")
+
+    assert resp.status_code == 200
+    assert not dataset.exists()
+
+
+def test_delete_partial_failure_reports_failed_files(client, monkeypatch):
+    """逐项删除失败：尽力删其余，失败项如实上报（200，不回滚也不 500）。"""
+    dataset = paths.DATASETS_DIR / "alice"
+    _write_wav(dataset / "locked.wav")
+    _write_wav(dataset / "free.wav")
+
+    real_unlink = os.unlink
+
+    def stubborn_unlink(path, *args, **kwargs):
+        if Path(path).name == "locked.wav":
+            raise OSError("Resource busy")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", stubborn_unlink)
+
+    resp = client.delete("/api/datasets/alice")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["failed_files"] == ["locked.wav"]
+    assert body["deleted"] is False  # 目录仍有残留，如实标未删净
+    assert (dataset / "locked.wav").exists()
+    assert not (dataset / "free.wav").exists()  # 其余文件照删
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 权限位语义（Windows 的 chmod 只置只读位）")
+def test_delete_total_failure_returns_500(client):
+    """目录整体无法推进（顶层不可进入）且无逐项失败可报 → 500。
+
+    chmod 000 下 rmtree 的顶层 open 失败走回调且 path 即目录自身——与实现的
+    「目录自身失败不进 failed_files，交整体判定兜底」分支对应，无需打桩。
+    """
+    dataset = paths.DATASETS_DIR / "alice"
+    _write_wav(dataset / "a.wav")
+    dataset.chmod(0o000)
+    try:
+        resp = client.delete("/api/datasets/alice")
+    finally:
+        dataset.chmod(0o700)  # 恢复权限，避免 pytest 清理 tmp_path 时连带失败
+
+    assert resp.status_code == 500
+    assert dataset.exists()
+
+
+# ---------------------------------------------------------------------------
 # _audio_duration：av 主路 / soundfile 兜底 / 全失败 None
 # ---------------------------------------------------------------------------
 
