@@ -1,0 +1,12 @@
+/assets/hubert_base
+/assets/rmvpe
+/assets/pretrained_v2
+/assets/pretrained
+/assets/indices
+/assets/weights
+/logs
+__pycache__/
+*.pyc
+.git-worktree-exclude
+frontend/node_modules/
+server/static/

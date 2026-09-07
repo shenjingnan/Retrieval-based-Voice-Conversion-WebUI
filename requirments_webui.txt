@@ -1,0 +1,15 @@
+# 新版 WebUI 编排层专用（server/），与旧 webui.py 的 Gradio 依赖隔离。
+# 要求 Python 3.13+。从项目根目录安装：
+#   python -m pip install -r requirments_webui.txt
+#
+# 前置：本清单只是 server 层的增量依赖，需先按硬件安装下列清单之一
+#   （torch、faiss、numpy 等核心依赖在其中，本清单不重复列出）：
+#   requirments_cpu_py312.txt / requirments_cu118_py312.txt / requirments_cu128_py312.txt
+#
+# 版本为当前实测可用的下限（Python 3.13.2 验证通过）。
+
+fastapi>=0.139.0
+uvicorn>=0.34.3
+soundfile>=0.13.0,<1  # server/api/infer.py 写 wav（import 期硬依赖）
+httpx>=0.28.1  # fastapi.testclient 依赖
+pytest>=8.4.2

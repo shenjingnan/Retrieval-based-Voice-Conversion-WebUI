@@ -1,0 +1,8 @@
+# 构建产物与本地运行时产物
+__pycache__/
+*.pyc
+.pytest_cache/
+server/static/
+
+# 本仓库的 git worktree 目录
+.worktrees/
