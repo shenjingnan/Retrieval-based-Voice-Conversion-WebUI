@@ -286,7 +286,10 @@ def test_pipeline_builds_all_steps_in_one_task(stub, client, monkeypatch, tmp_pa
         "mi-test", "48k", True, 8, 20, 5, False, "", "", version="v2"
     )
     assert call["log_path"] == paths.LOGS_DIR / "mi-test" / "pipeline_task.log"
-    assert call["setup"] is None  # 任务级 setup 会在首个 cmd 前误判产物校验，pipeline 禁用
+    # setup 只承担 batch_size 默认值说明（显式传值时无输出）；产物校验必须走 precheck /
+    # fitprep 子进程——任务级 setup 在首个 cmd 前执行，拿去校验会误判新实验（见 fitprep 时序）
+    assert call["setup"] is not None
+    assert call["setup"]() == []
     # 前端进度条需要 total_epoch：任务元数据随创建登记
     assert training._TASK_META["task-1"] == {"total_epoch": 20}
 
@@ -454,6 +457,118 @@ def test_v2_32k_keeps_32k(stub, client):
 
     assert resp.status_code == 200
     assert "-sr 32k" in stub.created[0]["cmds"][0]
+
+
+# ---------------------------------------------------------------------------
+# 2.5 batch_size 设备默认（webui.py:175-183 显存÷2；None → 解析值 + 任务日志说明行）
+# ---------------------------------------------------------------------------
+
+
+def _stub_gpu_memory(monkeypatch, memory):
+    """替换 GPU 探测底层（commands 里两个入口共用的唯一数据源，替换一次即可）：
+    memory 是 GPU_MEMORY 的值列表，8.4 ≈ 8 GiB 卡（total/1024**3 + 0.4）。"""
+    monkeypatch.setattr(commands, "_eligible_gpu_memory_gb", lambda: memory)
+
+
+def _fit_body_without_batch_size():
+    return {key: value for key, value in FIT_BODY.items() if key != "batch_size"}
+
+
+def test_fit_without_batch_size_uses_device_default(stub, client, monkeypatch):
+    """batch_size 缺省 → 命令用解析值（8 GiB 卡 ÷2 = 4），任务日志首行说明来源。"""
+    _stub_gpu_memory(monkeypatch, [8.4])
+    _fabricate_features(paths.LOGS_DIR / "mi-test")  # setup 会真跑 filelist 生成
+
+    resp = client.post("/api/train/fit", json=_fit_body_without_batch_size())
+
+    assert resp.status_code == 200
+    call = stub.created[0]
+    assert " -bs 4 " in call["cmds"][0]
+    assert call["setup"] is not None
+    lines = call["setup"]()
+    assert lines[0] == "batch_size 未指定，按设备默认使用 4（可用显卡最小显存 8.4 GB ÷ 2）"
+
+
+def test_fit_without_batch_size_no_gpu_falls_back_to_one(stub, client, monkeypatch):
+    _stub_gpu_memory(monkeypatch, [])
+    _fabricate_features(paths.LOGS_DIR / "mi-test")
+
+    resp = client.post("/api/train/fit", json=_fit_body_without_batch_size())
+
+    assert resp.status_code == 200
+    call = stub.created[0]
+    assert " -bs 1 " in call["cmds"][0]
+    assert call["setup"]()[0] == "batch_size 未指定，按设备默认使用 1（无可用显卡）"
+
+
+def test_fit_explicit_batch_size_bypasses_default(stub, client, monkeypatch):
+    """显式值不受设备默认影响，也不产生说明行（底模提示行照旧）。"""
+    _stub_gpu_memory(monkeypatch, [8.4])
+    _fabricate_features(paths.LOGS_DIR / "mi-test")
+
+    resp = client.post("/api/train/fit", json={**FIT_BODY, "batch_size": 6})
+
+    assert resp.status_code == 200
+    call = stub.created[0]
+    assert " -bs 6 " in call["cmds"][0]
+    assert all("batch_size 未指定" not in line for line in call["setup"]())
+
+
+def test_fit_null_batch_size_equals_omitted(stub, client, monkeypatch):
+    """显式 null 与省略字段同轨（前端「自动」态就是发 null/不发字段）。"""
+    _stub_gpu_memory(monkeypatch, [8.4])
+
+    resp = client.post("/api/train/fit", json={**FIT_BODY, "batch_size": None})
+
+    assert resp.status_code == 200
+    assert " -bs 4 " in stub.created[0]["cmds"][0]
+
+
+def test_fit_zero_batch_size_still_rejected(stub, client, monkeypatch):
+    """默认值逻辑不放松校验：显式 0 依旧 400（解析值自带 max(1, …) 下限）。"""
+    _stub_gpu_memory(monkeypatch, [8.4])
+
+    resp = client.post("/api/train/fit", json={**FIT_BODY, "batch_size": 0})
+
+    assert resp.status_code == 400
+    assert stub.created == []
+
+
+def test_pipeline_without_batch_size_uses_device_default(stub, client, monkeypatch, tmp_path):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    _stub_gpu_memory(monkeypatch, [8.4])
+
+    resp = client.post(
+        "/api/train/pipeline",
+        json={**_fit_body_without_batch_size(), "dataset_dir": str(dataset)},
+    )
+
+    assert resp.status_code == 200
+    call = stub.created[0]
+    assert " -bs 4 " in call["cmds"][5]  # fit 是第 6 个 cmd
+    # pipeline 的 setup 只输出说明行，不做产物校验（时序见 start_pipeline docstring）
+    assert call["setup"]() == [
+        "batch_size 未指定，按设备默认使用 4（可用显卡最小显存 8.4 GB ÷ 2）"
+    ]
+
+
+def test_train_defaults_returns_resolved_batch_size(client, monkeypatch):
+    _stub_gpu_memory(monkeypatch, [8.4])
+
+    resp = client.get("/api/train/defaults")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"batch_size": 4}
+
+
+def test_train_defaults_without_gpu_returns_one(client, monkeypatch):
+    _stub_gpu_memory(monkeypatch, [])
+
+    resp = client.get("/api/train/defaults")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"batch_size": 1}
 
 
 # ---------------------------------------------------------------------------

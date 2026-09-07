@@ -74,6 +74,45 @@ def resolve_is_half() -> bool:
     return _is_half
 
 
+def _eligible_gpu_memory_gb() -> list:
+    """全部可用显卡的显存（GB），与 webui 的默认 batch_size 同源；无可用卡返回空表。
+
+    访问路径（configs/config.py 模块级探测结果，webui.py:44 原样导入后使用）：
+    - GPU_MEMORY: {device.index: 显存GB}，GB 由 total_memory / 1024**3 + 0.4 得出
+    - GPU_INDEX:  上述 dict 键的集合（webui 用 sorted() 后再逐个查 GPU_MEMORY）
+    - IS_GPU:     是否存在满足显卡规则的卡（<4 GiB 或 SM<5.3 的卡不在其中）
+
+    不能改用 Config 实例取显存：Config.gpu_mem 只是推理默认设备单卡的显存，
+    承载不了 webui「多卡取最小」的语义；函数内延迟导入即可复用模块级的同一次
+    torch 探测（与本模块其余惰性入口同一纪律）。"""
+    from configs.config import GPU_INDEX, GPU_MEMORY, IS_GPU  # 延迟导入：见模块 docstring
+
+    if not IS_GPU:
+        return []
+    return [GPU_MEMORY[index] for index in sorted(GPU_INDEX)]
+
+
+def resolve_default_batch_size() -> int:
+    """训练 batch_size 的设备自适应默认值（webui.py:175-183 滑条预填逻辑逐字对齐）：
+    有可用显卡取「最小显存 GB ÷ 2」（下限 1），无可用卡（Mac/CPU/不满足规则的卡）为 1。"""
+    memory = _eligible_gpu_memory_gb()
+    if not memory:
+        return 1
+    return max(1, int(min(memory)) // 2)
+
+
+def default_batch_size_note(value: int) -> str:
+    """batch_size 走设备默认时的任务日志说明行（同 _pretrained_notices 的目的：
+    静默替换用户输入会让人误以为按自己填的值在跑，来源必须可见）。"""
+    memory = _eligible_gpu_memory_gb()
+    if not memory:
+        return "batch_size 未指定，按设备默认使用 %d（无可用显卡）" % value
+    return "batch_size 未指定，按设备默认使用 %d（可用显卡最小显存 %.1f GB ÷ 2）" % (
+        value,
+        min(memory),
+    )
+
+
 def build_preprocess_cmd(dataset_dir, sr: int, n_p, exp, noparallel, per) -> str:
     """sr 传 int（调用方先经 SR_DICT 转换，webui.py:853 同源），与 build_fit_cmd 的
     SampleRate 档位串不同轨；noparallel 传 bool（%s → True/False）；

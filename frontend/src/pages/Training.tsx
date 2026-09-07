@@ -237,23 +237,33 @@ function LossChart({ points }: { points: LossPoint[] }) {
 interface NumberFieldProps {
   id: string
   label: string
-  value: number
-  onChange: (value: number) => void
+  /** null = 未指定（自动）：显示占位文案，提交时不发该字段 */
+  value: number | null
+  onChange: (value: number | null) => void
+  placeholder?: string
   hint?: string
 }
 
-/** 数值输入：非法输入（空串等）归 0，由调用方校验提示「至少为 1」 */
-function NumberField({ id, label, value, onChange, hint }: NumberFieldProps) {
+/** 数值输入：非法输入（空串等）归 null（由调用方决定 null 语义），数值由调用方校验 */
+function NumberField({ id, label, value, onChange, placeholder, hint }: NumberFieldProps) {
   function onInput(e: ChangeEvent<HTMLInputElement>) {
     const n = e.target.valueAsNumber
-    onChange(Number.isNaN(n) ? 0 : n)
+    onChange(Number.isNaN(n) ? null : n)
   }
   return (
     <div className="flex flex-col gap-1.5">
       <label htmlFor={id} className="text-sm font-medium">
         {label}
       </label>
-      <Input id={id} type="number" min={1} step={1} value={value} onChange={onInput} />
+      <Input
+        id={id}
+        type="number"
+        min={1}
+        step={1}
+        value={value ?? ''}
+        onChange={onInput}
+        placeholder={placeholder}
+      />
       {hint !== undefined && <p className="text-xs text-muted-foreground">{hint}</p>}
     </div>
   )
@@ -275,8 +285,11 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   const [version, setVersion] = useState<ModelVersion>('v2')
   const [totalEpoch, setTotalEpoch] = useState(20)
   const [saveEveryEpoch, setSaveEveryEpoch] = useState(5)
-  const [batchSize, setBatchSize] = useState(8)
+  /** null = 自动：提交时不发字段，由后端按设备自适应解析（webui 显存GB÷2，无卡为 1） */
+  const [batchSize, setBatchSize] = useState<number | null>(null)
   const [saveEveryWeights, setSaveEveryWeights] = useState(false)
+  /** 用户是否手动改过 batch size：改过就不再用 /api/train/defaults 的解析值覆盖 */
+  const batchSizeTouched = useRef(false)
 
   // -- 任务编排 -------------------------------------------------------------
   const [stepStates, setStepStates] = useState<Record<StepId, StepState>>(INITIAL_STEP_STATES)
@@ -301,11 +314,24 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
     }
   }, [])
 
+  // 挂载时把设备自适应默认值预填进 batch size（对齐 webui 在滑条上预填解析值的行为）：
+  // 用户已手动改过则不覆盖；拉取失败保持「自动」，提交时省略字段，后端按同一逻辑解析
+  useEffect(() => {
+    void api
+      .trainDefaults()
+      .then(({ batch_size }) => {
+        if (!mounted.current || batchSizeTouched.current) return
+        setBatchSize(batch_size)
+      })
+      .catch(() => undefined) // 预填失败不阻塞页面：自动语义不依赖该请求
+  }, [])
+
   // -- 校验（派生） ---------------------------------------------------------
   const expNameValid = expName !== '.' && expName !== '..' && EXP_NAME_RE.test(expName)
   const datasetValid =
     datasetDir.length > 0 && !DATASET_BAD_RE.test(datasetDir) && !datasetDir.endsWith('\\')
-  const epochsValid = totalEpoch >= 1 && saveEveryEpoch >= 1 && batchSize >= 1
+  const epochsValid =
+    totalEpoch >= 1 && saveEveryEpoch >= 1 && (batchSize === null || batchSize >= 1)
   const formValid = expNameValid && datasetValid && epochsValid
 
   // v1 没有 32k 档（server/api/training.py _normalize_sr，webui change_version19 语义）。
@@ -322,7 +348,8 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
       f0_method: f0Method,
       total_epoch: totalEpoch,
       save_every_epoch: saveEveryEpoch,
-      batch_size: batchSize,
+      // 自动（null）时键省略：后端按设备解析，任务日志会记下实际使用的值与来源
+      ...(batchSize === null ? {} : { batch_size: batchSize }),
       save_every_weights: saveEveryWeights,
     }
   }
@@ -443,7 +470,11 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
     datasetDir.length > 0 && !datasetValid
       ? '路径不得含引号、$、反引号、换行，且不能以反斜杠结尾'
       : null
-  const epochsHint = !epochsValid ? '总轮次、保存间隔与 batch size 都必须至少为 1' : null
+  const epochsHint = !epochsValid
+    ? totalEpoch < 1 || saveEveryEpoch < 1
+      ? '总轮次与保存间隔都必须至少为 1'
+      : 'batch size 必须至少为 1'
+    : null
 
   function cellState(key: StepId | 'config'): StepState {
     if (key === 'config') return formValid ? 'success' : 'idle'
@@ -640,21 +671,25 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
               id="train-total-epoch"
               label="总轮次（total_epoch）"
               value={totalEpoch}
-              onChange={setTotalEpoch}
+              onChange={(value) => setTotalEpoch(value ?? 0)}
             />
             <NumberField
               id="train-save-epoch"
               label="保存间隔（save_every_epoch）"
               value={saveEveryEpoch}
-              onChange={setSaveEveryEpoch}
+              onChange={(value) => setSaveEveryEpoch(value ?? 0)}
               hint="每多少轮保存一次检查点"
             />
             <NumberField
               id="train-batch-size"
               label="batch size"
               value={batchSize}
-              onChange={setBatchSize}
-              hint="显存不足就调小"
+              onChange={(value) => {
+                batchSizeTouched.current = true
+                setBatchSize(value)
+              }}
+              placeholder="自动"
+              hint="按设备默认：显卡=显存GB÷2，CPU=1；显存不足就调小"
             />
             <div className="flex flex-col gap-1.5">
               <span className="text-sm font-medium">逐轮保存权重</span>

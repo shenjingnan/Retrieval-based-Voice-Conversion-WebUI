@@ -248,3 +248,55 @@ def test_config_probe_is_thread_safe(monkeypatch):
         assert len(entered) == 4, round_index
         assert all(argv == ["pytest"] for argv in entered), (round_index, entered)
         assert sys.argv == original, (round_index, sys.argv)  # 未被截断/污染
+
+
+# ---------------------------------------------------------------------------
+# batch_size 设备默认（webui.py:175-183 滑条预填逻辑）
+# ---------------------------------------------------------------------------
+
+
+def _fake_gpu_config(monkeypatch, *, memory):
+    """注入假 configs.config 的模块级 GPU 探测结果。
+    GPU_MEMORY 的值带 +0.4 容差（config.py：total_memory / 1024**3 + 0.4），
+    8 GiB 卡在该表里约是 8.4。"""
+    fake_module = ModuleType("configs.config")
+    fake_module.IS_GPU = bool(memory)
+    fake_module.GPU_INDEX = set(memory)
+    fake_module.GPU_MEMORY = memory
+    monkeypatch.setitem(sys.modules, "configs.config", fake_module)
+
+
+def test_resolve_default_batch_size_gpu_8gb(monkeypatch):
+    _fake_gpu_config(monkeypatch, memory={0: 8.4})
+    assert commands.resolve_default_batch_size() == 4
+
+
+def test_resolve_default_batch_size_multi_gpu_takes_min(monkeypatch):
+    # webui：min(GPU_MEMORY[i] for i in sorted(GPU_INDEX))——按最小的那张卡算
+    _fake_gpu_config(monkeypatch, memory={1: 24.4, 0: 8.4})
+    assert commands.resolve_default_batch_size() == 4
+
+
+def test_resolve_default_batch_size_no_gpu(monkeypatch):
+    _fake_gpu_config(monkeypatch, memory={})
+    assert commands.resolve_default_batch_size() == 1
+
+
+def test_resolve_default_batch_size_tiny_gpu_floor_at_one(monkeypatch):
+    # max(1, ...)：小显存（1 GiB → 1 // 2 = 0）不得给出 0（webui 同款下限）
+    _fake_gpu_config(monkeypatch, memory={0: 1.4})
+    assert commands.resolve_default_batch_size() == 1
+
+
+def test_default_batch_size_note_gpu(monkeypatch):
+    _fake_gpu_config(monkeypatch, memory={0: 12.4, 1: 8.4})
+    assert commands.default_batch_size_note(4) == (
+        "batch_size 未指定，按设备默认使用 4（可用显卡最小显存 8.4 GB ÷ 2）"
+    )
+
+
+def test_default_batch_size_note_no_gpu(monkeypatch):
+    _fake_gpu_config(monkeypatch, memory={})
+    assert commands.default_batch_size_note(1) == (
+        "batch_size 未指定，按设备默认使用 1（无可用显卡）"
+    )

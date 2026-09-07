@@ -30,6 +30,7 @@ export type TrainF0Method = 'rmvpe' | 'pm'
  * 训练参数（字段并集）。与 server/api/training.py 的 PreprocessBody / ExtractBody /
  * FitBody / PipelineBody 逐字段对齐；分步接口只取各自需要的子集。
  * n_p（进程数）不在其中：后端固定取 os.cpu_count()，前端没有调参入口。
+ * batch_size 可选：省略（自动）时后端按设备自适应解析（webui 显存GB÷2，无卡为 1）。
  */
 export interface TrainParams {
   exp_name: string
@@ -40,7 +41,7 @@ export interface TrainParams {
   f0_method: TrainF0Method
   total_epoch: number
   save_every_epoch: number
-  batch_size: number
+  batch_size?: number
   save_every_weights: boolean
 }
 
@@ -122,12 +123,17 @@ export const api = {
       if_f0: p.if_f0,
       total_epoch: p.total_epoch,
       save_every_epoch: p.save_every_epoch,
-      batch_size: p.batch_size,
+      // 自动（undefined）时键省略：后端按设备自适应解析并在任务日志里记来源
+      ...(p.batch_size === undefined ? {} : { batch_size: p.batch_size }),
       save_every_weights: p.save_every_weights,
     }),
 
   trainIndex: (p: { exp_name: string; version: ModelVersion }): Promise<TaskCreated> =>
     postJson('/api/train/index', { exp_name: p.exp_name, version: p.version }),
+
+  /** GET /api/train/defaults：与 webui 滑条同源的自适应 batch_size（显卡=显存GB÷2，无卡=1） */
+  trainDefaults: (): Promise<{ batch_size: number }> =>
+    fetch('/api/train/defaults').then((r) => handle<{ batch_size: number }>(r)),
 
   // 注意 pipeline 不传 n_p：后端 PipelineBody 未声明该字段（内部固定 os.cpu_count()）
   trainPipeline: (p: TrainParams): Promise<TaskCreated> =>
@@ -140,7 +146,8 @@ export const api = {
       f0_method: p.f0_method,
       total_epoch: p.total_epoch,
       save_every_epoch: p.save_every_epoch,
-      batch_size: p.batch_size,
+      // 自动（undefined）时键省略：后端按设备自适应解析并在任务日志里记来源
+      ...(p.batch_size === undefined ? {} : { batch_size: p.batch_size }),
       save_every_weights: p.save_every_weights,
     }),
 

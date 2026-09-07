@@ -36,8 +36,10 @@ from server.commands import (  # noqa: F401  SampleRate 仅用于类型注解
     build_index_cmd,
     build_precheck_cmd,
     build_preprocess_cmd,
+    default_batch_size_note,
     get_pretrained_paths,
     pretrained_rel_paths,
+    resolve_default_batch_size,
     resolve_is_half,
 )
 from server.progress import parse_stage_progress_line, parse_train_line
@@ -86,7 +88,8 @@ class FitBody(BaseModel):
     if_f0: bool
     total_epoch: int
     save_every_epoch: int
-    batch_size: int
+    # None（未指定）→ 按设备自适应解析（webui 滑条预填逻辑：最小显存GB÷2，无卡为 1）
+    batch_size: int | None = None
     save_every_weights: bool = False
 
 
@@ -159,8 +162,17 @@ def _check_f0_method(value: str) -> str:
 def _check_epochs(body: FitBody) -> None:
     for name in ("total_epoch", "save_every_epoch", "batch_size"):
         value = getattr(body, name)
-        if value < 1:
+        if value is not None and value < 1:  # batch_size 允许 None（设备默认）
             raise HTTPException(400, "%s 必须为正整数：%s" % (name, value))
+
+
+def _resolve_batch_size(batch_size: int | None) -> tuple[int, str | None]:
+    """编排层的 batch_size 归一：显式值原样透传；None → 设备自适应值 + 任务日志提示行
+    （返回 (值, 提示行)，提示行仅在走默认时非 None，由 setup 钩子写进任务日志）。"""
+    if batch_size is not None:
+        return batch_size, None
+    resolved = resolve_default_batch_size()
+    return resolved, default_batch_size_note(resolved)
 
 
 def _normalize_sr(sr: str, version: str) -> str:
@@ -462,23 +474,24 @@ def start_fit(body: FitBody):
     version = _check_version(body.version)
     sr = _normalize_sr(_check_sr(body.sr), version)
     _check_epochs(body)
+    batch_size, batch_note = _resolve_batch_size(body.batch_size)
     exp_dir = paths.LOGS_DIR / exp_name
     return _create(
         "fit",
-        [_fit_cmd(body, sr, version)],
+        [_fit_cmd(body, sr, version, batch_size)],
         _task_log(exp_name, "train_task_fit.log"),
-        setup=_fit_setup(exp_dir, sr, version, body.if_f0),
+        setup=_fit_setup(exp_dir, sr, version, body.if_f0, batch_note),
         meta={"total_epoch": body.total_epoch},
     )
 
 
-def _fit_cmd(body: FitBody, sr: str, version: str) -> str:
+def _fit_cmd(body: FitBody, sr: str, version: str, batch_size: int) -> str:
     pretrain_g, pretrain_d = get_pretrained_paths(sr, body.if_f0, version)
     return build_fit_cmd(
         body.exp_name,
         sr,
         body.if_f0,
-        body.batch_size,
+        batch_size,
         body.total_epoch,
         body.save_every_epoch,
         body.save_every_weights,
@@ -488,12 +501,20 @@ def _fit_cmd(body: FitBody, sr: str, version: str) -> str:
     )
 
 
-def _fit_setup(exp_dir: Path, sr: str, version: str, if_f0: bool):
-    """fit 的 setup 钩子：返回值（底模缺失提示行）由 tasks.py 写进任务日志缓冲。"""
+def _fit_setup(exp_dir: Path, sr: str, version: str, if_f0: bool, batch_note: str | None = None):
+    """fit 的 setup 钩子：返回值（batch_size 默认值说明 + 底模缺失提示行）由 tasks.py
+    写进任务日志缓冲。"""
     def setup():
-        return prepare_fit(exp_dir, sr, version, if_f0)
+        return ([batch_note] if batch_note else []) + prepare_fit(exp_dir, sr, version, if_f0)
 
     return setup
+
+
+@router.get("/train/defaults")
+def train_defaults():
+    """训练表单的设备自适应默认值（webui 滑条预填值同源）。轻量只读端点，供前端
+    把解析值预填进输入框；只回 batch_size，不承载其它配置。"""
+    return {"batch_size": resolve_default_batch_size()}
 
 
 @router.post("/train/index")
@@ -511,7 +532,8 @@ def start_pipeline(body: PipelineBody):
     precheck / fitprep 两个 Python 前置以子进程 cmd 的形式插在对应子进程之后
     （见 build_precheck_cmd / build_fitprep_cmd），时序因此与分步流程完全一致；
     任务级 setup 钩子做不到这一点——它只在首个 cmd 之前跑一次，会让新实验在
-    preprocess 还没执行时就被产物校验判死。
+    preprocess 还没执行时就被产物校验判死。因此这里的 setup 只承担与时序无关的
+    batch_size 默认值提示（不做任何产物校验）。
     """
     exp_name = _check_exp_name(body.exp_name)
     dataset_dir = _check_dataset_dir(body.dataset_dir)
@@ -519,6 +541,7 @@ def start_pipeline(body: PipelineBody):
     f0_method = _check_f0_method(body.f0_method)
     sr = _normalize_sr(_check_sr(body.sr), version)
     _check_epochs(body)
+    batch_size, batch_note = _resolve_batch_size(body.batch_size)
     n_p = os.cpu_count()
     exp_dir = paths.LOGS_DIR / exp_name
 
@@ -528,14 +551,24 @@ def start_pipeline(body: PipelineBody):
         cmds.append(build_extract_f0_cmd(exp_name, n_p, f0_method))
     cmds.append(build_extract_hubert_cmd(exp_name, version, resolve_is_half()))
     cmds.append(build_fitprep_cmd(exp_name, sr, version, body.if_f0))
-    cmds.append(_fit_cmd(body, sr, version))
+    cmds.append(_fit_cmd(body, sr, version, batch_size))
     cmds.append(build_index_cmd(exp_name, version, os.cpu_count()))
     return _create(
         "pipeline",
         cmds,
         _task_log(exp_name, "pipeline_task.log"),
+        setup=_pipeline_notice_setup(batch_note),
         meta={"total_epoch": body.total_epoch},
     )
+
+
+def _pipeline_notice_setup(batch_note: str | None):
+    """pipeline 的 setup 钩子：只回 batch_size 说明行（可能为 None → 无输出），
+    与 fit 的产物校验前置严格分离——见 start_pipeline 的时序说明。"""
+    def setup():
+        return [batch_note] if batch_note else []
+
+    return setup
 
 
 # ---------------------------------------------------------------------------
