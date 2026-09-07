@@ -161,7 +161,7 @@ if __name__ == "__main__":
                                     initial_folder=os.path.join(
                                         os.getcwd(), "assets/weights"
                                     ),
-                                    file_types=((". pth"),),
+                                    file_types=(("PTH Files", "*.pth"),),
                                 ),
                             ],
                             [
@@ -172,7 +172,7 @@ if __name__ == "__main__":
                                 sg.FileBrowse(
                                     i18n("选择.index文件"),
                                     initial_folder=os.path.join(os.getcwd(), "logs"),
-                                    file_types=((". index"),),
+                                    file_types=(("Index Files", "*.index"),),
                                 ),
                             ],
                         ],
@@ -330,7 +330,7 @@ if __name__ == "__main__":
                             [
                                 sg.Text(i18n("采样长度")),
                                 sg.Slider(
-                                    range=(0.02, 1.5),
+                                    range=(0.02, 3.0),
                                     key="block_time",
                                     resolution=0.01,
                                     orientation="h",
@@ -565,8 +565,17 @@ if __name__ == "__main__":
             ]
             return True
 
+        @staticmethod
+        def _torch_rms(y, frame_length, hop_length):
+            """Compute RMS envelope fully on-device, matching librosa.feature.rms."""
+            n_frames = 1 + (y.shape[0] - frame_length) // hop_length
+            y_frames = y.unfold(0, frame_length, hop_length)[:n_frames]
+            return torch.sqrt(torch.mean(y_frames * y_frames, dim=1) + 1e-8).unsqueeze(0)
+
         def start_vc(self):
             torch.cuda.empty_cache()
+            self._callback_count = 0
+            self._last_callback_time = None
             self.rvc = rvc_for_realtime.RVC(
                 self.gui_config.pitch,
                 self.gui_config.formant,
@@ -680,10 +689,87 @@ if __name__ == "__main__":
             self.tg = TorchGate(
                 sr=self.gui_config.samplerate, n_fft=4 * self.zc, prop_decrease=0.9
             ).to(self.config.device)
-            self.prewarm_cuda_graph()
+            self.prewarm_mps_or_cuda_graph()
             self.start_stream()
 
-        def prewarm_cuda_graph(self):
+        def prewarm_mps_or_cuda_graph(self):
+            # MPS warmup: simulate the full audio callback path to compile all
+            # Metal kernels upfront.  Without this, the first few callbacks
+            # compile kernels on the fly and the MPS queue can build up,
+            # causing audio dropouts.
+            if self.config.device == "mps":
+                try:
+                    printt(i18n("正在预热MPS（模拟完整音频管线）..."))
+                    # -- fake input audio --
+                    fake_indata = (
+                        np.random.randn(self.block_frame).astype(np.float32) * 0.01
+                    )
+                    self.input_wav[-fake_indata.shape[0] :] = torch.from_numpy(
+                        fake_indata
+                    ).to(self.config.device)
+                    # -- resample to 16 kHz --
+                    resample_input = self.input_wav[
+                        -fake_indata.shape[0] - 2 * self.zc :
+                    ]
+                    self.input_wav_res[
+                        -160 * (fake_indata.shape[0] // self.zc + 1) :
+                    ] = self.resampler(resample_input)[160:]
+                    # -- RVC inference --
+                    infer_wav = self.rvc.infer(
+                        self.input_wav_res,
+                        self.block_frame_16k,
+                        self.skip_head,
+                        self.return_length,
+                        self.gui_config.f0method,
+                    )
+                    # -- RMS envelope (warm the torch_rms + interpolate path) --
+                    if self.gui_config.rms_mix_rate < 1:
+                        rms1 = self._torch_rms(
+                            self.input_wav[self.extra_frame : self.extra_frame
+                                           + infer_wav.shape[0]],
+                            4 * self.zc,
+                            self.zc,
+                        )
+                        F.interpolate(
+                            rms1.unsqueeze(0),
+                            size=infer_wav.shape[0] + 1,
+                            mode="linear",
+                            align_corners=True,
+                        )
+                        rms2 = self._torch_rms(
+                            infer_wav[:], 4 * self.zc, self.zc
+                        )
+                        F.interpolate(
+                            rms2.unsqueeze(0),
+                            size=infer_wav.shape[0] + 1,
+                            mode="linear",
+                            align_corners=True,
+                        )
+                    # -- SOLA correlation --
+                    conv_input = infer_wav[
+                        None, None,
+                        : self.sola_buffer_frame + self.sola_search_frame,
+                    ]
+                    cor_nom = F.conv1d(
+                        conv_input, self.sola_buffer[None, None, :]
+                    )
+                    cor_den = torch.sqrt(
+                        F.conv1d(conv_input**2, self.sola_den_kernel) + 1e-8
+                    )
+                    torch.max(cor_nom[0, 0] / cor_den[0, 0], dim=0)
+                    torch.mps.synchronize()
+                    printt(i18n("MPS预热完成"))
+                except Exception:
+                    printt(traceback.format_exc())
+                finally:
+                    self.input_wav.zero_()
+                    self.input_wav_res.zero_()
+                    self.output_buffer.zero_()
+                    self.sola_buffer.zero_()
+                    self.nr_buffer.zero_()
+                    self.rvc.cache_pitch.zero_()
+                    self.rvc.cache_pitchf.zero_()
+                return
             if not cuda_graph_enabled(self.config.device):
                 return
             try:
@@ -757,6 +843,7 @@ if __name__ == "__main__":
                     channels=self.gui_config.channels,
                     dtype="float32",
                     extra_settings=extra_settings,
+                    latency="high",
                 )
                 self.stream.start()
 
@@ -777,6 +864,20 @@ if __name__ == "__main__":
             """
             global flag_vc
             start_time = time.perf_counter()
+            # Diagnose audio scheduling jitter: warn if the callback
+            # interval deviates significantly from the expected block_time.
+            if self._last_callback_time is not None:
+                actual_interval = start_time - self._last_callback_time
+                expected_interval = self.gui_config.block_time
+                drift = actual_interval - expected_interval
+                if abs(drift) > expected_interval * 0.5:
+                    printt(
+                        "⚠ 音频回调间隔异常: 期望=%.0fms 实际=%.0fms 偏差=%.0fms",
+                        expected_interval * 1000,
+                        actual_interval * 1000,
+                        drift * 1000,
+                    )
+            self._last_callback_time = start_time
             indata = librosa.to_mono(indata.T)
             if self.gui_config.threhold > -60:
                 indata = np.append(self.rms_buffer, indata)
@@ -870,24 +971,19 @@ if __name__ == "__main__":
                     input_wav = self.input_wav_denoise[self.extra_frame :]
                 else:
                     input_wav = self.input_wav[self.extra_frame :]
-                rms1 = librosa.feature.rms(
-                    y=input_wav[: infer_wav.shape[0]].cpu().numpy(),
-                    frame_length=4 * self.zc,
-                    hop_length=self.zc,
+                # Use on-device RMS instead of librosa to avoid MPS↔CPU transfers.
+                rms1 = self._torch_rms(
+                    input_wav[: infer_wav.shape[0]], 4 * self.zc, self.zc
                 )
-                rms1 = torch.from_numpy(rms1).to(self.config.device)
                 rms1 = F.interpolate(
                     rms1.unsqueeze(0),
                     size=infer_wav.shape[0] + 1,
                     mode="linear",
                     align_corners=True,
                 )[0, 0, :-1]
-                rms2 = librosa.feature.rms(
-                    y=infer_wav[:].cpu().numpy(),
-                    frame_length=4 * self.zc,
-                    hop_length=self.zc,
+                rms2 = self._torch_rms(
+                    infer_wav[:], 4 * self.zc, self.zc
                 )
-                rms2 = torch.from_numpy(rms2).to(self.config.device)
                 rms2 = F.interpolate(
                     rms2.unsqueeze(0),
                     size=infer_wav.shape[0] + 1,
@@ -911,11 +1007,13 @@ if __name__ == "__main__":
                 + 1e-8
             )
             if sys.platform == "darwin":
-                _, sola_offset = torch.max(cor_nom[0, 0] / cor_den[0, 0])
+                _, sola_offset = torch.max(cor_nom[0, 0] / cor_den[0, 0], dim=0)
                 sola_offset = sola_offset.item()
             else:
                 sola_offset = torch.argmax(cor_nom[0, 0] / cor_den[0, 0])
-            printt(i18n("SOLA偏移：%d"), int(sola_offset))
+            # Only log every 100 callbacks to avoid print overhead in the audio thread.
+            if self._callback_count % 100 == 0:
+                printt(i18n("SOLA偏移：%d"), int(sola_offset))
             infer_wav = infer_wav[sola_offset:]
             infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
             infer_wav[: self.sola_buffer_frame] += (
@@ -932,9 +1030,13 @@ if __name__ == "__main__":
                 .numpy()
             )
             total_time = time.perf_counter() - start_time
-            if flag_vc:
-                self.window["infer_time"].update(int(total_time * 1000))
-            printt(i18n("推理耗时：%.2f秒"), total_time)
+            self._callback_count += 1
+            # Reduce GUI updates and prints to avoid thread-safety issues
+            # and I/O overhead in the real-time audio callback.
+            if self._callback_count % 20 == 0:
+                if flag_vc:
+                    self.window["infer_time"].update(int(total_time * 1000))
+                printt(i18n("推理耗时：%.2f秒"), total_time)
 
         def update_devices(self, hostapi_name=None):
             """获取设备列表"""

@@ -14,6 +14,35 @@ export const EXP_NAME_RE = /^[^\s"\\$`/]+$/
 export const DATASET_BAD_RE = /["`$\r\n]/
 
 /**
+ * 数据集音频口径（与 server/api/datasets.py 的 AUDIO_SUFFIXES 同源）：preprocess
+ * 遍历数据集目录不过滤扩展名（load_audio 走 ffmpeg），这里只列常见音频后缀，
+ * 其余文件由后端计入 other_count 并提示。
+ */
+export const AUDIO_SUFFIXES: readonly string[] = ['.wav', '.mp3', '.flac', '.ogg', '.m4a']
+
+/**
+ * 数据集名校验（与 server/api/datasets.py 的 _check_name 同源：字符集同 EXP_NAME_RE
+ * + 拒前导点 + 拒 NUL）。前导点被拒是因为 .meta 侧车目录与隐藏目录不能被当成数据集
+ * 访问；NUL 不是 \s，EXP_NAME_RE 放行它，但漏到后端 mkdir/unlink 层是 ValueError，
+ * 两侧都在入口先拒。server 改规则必须双侧同步。
+ */
+export function isValidDatasetName(s: string): boolean {
+  return s.length > 0 && !s.startsWith('.') && !s.includes('\0') && EXP_NAME_RE.test(s)
+}
+
+/**
+ * 秒 → 「12 分 34 秒」；null（后端时长探测全失败）→ 「未知」。
+ * 不换算小时：数据集以分钟计，与后端不做的规范化保持一致（超大值显示总分钟数）。
+ */
+export function formatDuration(sec: number | null): string {
+  if (sec === null) return '未知'
+  const total = Math.round(sec)
+  const min = Math.floor(total / 60)
+  const s = total % 60
+  return min > 0 ? `${min} 分 ${s} 秒` : `${s} 秒`
+}
+
+/**
  * 模型名 stem → 实验名（与 server/api/models.py 的 experiment_name 同源，含
  * IGNORECASE）：剥训练产物的 epoch/step 后缀，alice_v2_e20_s100 → alice_v2
  */

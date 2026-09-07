@@ -333,9 +333,11 @@ def test_pipeline_fresh_experiment_starts_preprocess(client, real_manager):
 
 @pytest.mark.parametrize(
     "exp_name",
-    ["", "../evil", "a/b", "..", ".", 'a"b', "a\\b", "a b", "a\tb", "a\nb", "a$b", "a`b"],
+    ["", "../evil", "a/b", "..", ".", 'a"b', "a\\b", "a b", "a\tb", "a\nb", "a$b", "a`b", "a\0b"],
 )
 def test_invalid_exp_name_rejected(stub, client, tmp_path, exp_name):
+    # a\0b：NUL 漏到任务编排层（mkdir/日志路径）会 ValueError，必须在 400 拦下
+    # （与 server.api.datasets._check_name 同步补的判定）
     dataset = tmp_path / "dataset"
     dataset.mkdir()
 

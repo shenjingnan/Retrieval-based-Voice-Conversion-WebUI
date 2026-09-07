@@ -8,7 +8,10 @@ __pycache__/
 server/static/
 TEMP/
 
-# 下载型模型资产与训练产物（README 指引下载/训练生成，不入库）
+# 下载型模型资产、训练产物与用户上传的训练数据集（README 指引下载/训练生成，不入库）
+# logs 不带斜杠：worktree 里的 logs 是指回主仓库的软链，带斜杠的规则只匹配目录、
+# 会把这个软链漏成 untracked
 assets/
-logs/
+logs
+datasets/
 .model-downloads/
