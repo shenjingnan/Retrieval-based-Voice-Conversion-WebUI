@@ -13,4 +13,7 @@ WEIGHTS_DIR = ASSETS / "weights"
 # P3 引入多说话人时需带 speaker_id 重新选索引。
 INDICES_DIR = ASSETS / "indices"
 LOGS_DIR = ROOT / "logs"
+# 用户上传的训练数据集根目录（server/api/datasets.py 维护其一级子目录）；
+# 训练侧拿到的是其中某个子目录的绝对路径（作为 dataset_dir 传给 preprocess）
+DATASETS_DIR = ROOT / "datasets"
 STATIC_DIR = Path(__file__).resolve().parent / "static"  # 前端构建产物，可能不存在

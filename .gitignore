@@ -8,7 +8,8 @@ __pycache__/
 server/static/
 TEMP/
 
-# 下载型模型资产与训练产物（README 指引下载/训练生成，不入库）
+# 下载型模型资产、训练产物与用户上传的训练数据集（README 指引下载/训练生成，不入库）
 assets/
 logs/
+datasets/
 .model-downloads/
