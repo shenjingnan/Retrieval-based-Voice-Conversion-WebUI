@@ -211,6 +211,27 @@ def build_precheck_cmd(exp) -> str:
     return '"%s" -m server.api.training precheck "%s"' % (sys.executable, exp)
 
 
+def build_separate_cmd(input_dir, output_dir, model, files=None) -> str:
+    """数据集人声分离（tools/vocal_dataset.py，设计见
+    docs/plans/2026-09-07-dataset-vocal-separation-design.md）。
+
+    model 是 tools.pymss_webui.MODEL_SPECS 的 label（中文）：API 侧经静态白名单校验
+    （server.api.datasets.SEPARATION_MODELS，服务进程不得 import 该模块——顶层加载
+    torch），label 本身不含 _EXP_FORBIDDEN 字符，双引号包裹后无 shell 注入面。
+    files 为可选的文件名子集（逐文件分离）：文件名来自用户上传，_safe_filename 会
+    放行 $ 反引号 引号 反斜杠，这些字符在双引号内有命令替换/逃逸风险——调用方
+    （server.api.datasets）必须先按同一字符表校验并确认文件存在于数据集内。"""
+    cmd = '"%s" -m tools.vocal_dataset "%s" "%s" --model "%s"' % (
+        sys.executable,
+        input_dir,
+        output_dir,
+        model,
+    )
+    for name in files or []:
+        cmd += ' --file "%s"' % name
+    return cmd
+
+
 def pretrained_rel_paths(sr: SampleRate, if_f0, version):
     """底模的相对路径串（不查存在性）：`assets/pretrained{path_str}/{f0}{G|D}{sr}.pth`。
     供 get_pretrained_paths 与编排层的「未使用底模」提示共用，避免两处拼法漂移。"""

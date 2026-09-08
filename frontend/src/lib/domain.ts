@@ -10,15 +10,35 @@
  */
 export const EXP_NAME_RE = /^[^\s"\\$`/]+$/
 
-/** 数据集路径（后端 _check_dataset_dir 拒绝引号、$、反引号、换行与结尾反斜杠） */
-export const DATASET_BAD_RE = /["`$\r\n]/
-
 /**
  * 数据集音频口径（与 server/api/datasets.py 的 AUDIO_SUFFIXES 同源）：preprocess
  * 遍历数据集目录不过滤扩展名（load_audio 走 ffmpeg），这里只列常见音频后缀，
  * 其余文件由后端计入 other_count 并提示。
  */
 export const AUDIO_SUFFIXES: readonly string[] = ['.wav', '.mp3', '.flac', '.ogg', '.m4a']
+
+/**
+ * 人声分离模型 label（与 server/api/datasets.py 的 SEPARATION_MODELS 逐字同源，
+ * 顺序即下拉顺序；server 侧注释同 tools.pymss_webui.MODEL_SPECS，改动须三处同步）。
+ */
+export const SEPARATION_MODELS: readonly string[] = [
+  '去混响',
+  '去混响（激进）',
+  '去伴奏',
+  '去伴奏（激进）',
+  '提主旋律',
+]
+
+/** 默认分离模型（与 server/api/datasets.py 的 DEFAULT_SEPARATION_MODEL 同源） */
+export const DEFAULT_SEPARATION_MODEL = '去伴奏'
+
+/** 分离产物数据集固定后缀（与 server/api/datasets.py 的 DERIVED_SUFFIX 同源） */
+export const DERIVED_SUFFIX = '_vocals'
+
+/** 分离产物数据集名：{source}_vocals（后端同名规则，前端预显示用） */
+export function derivedDatasetName(source: string): string {
+  return source + DERIVED_SUFFIX
+}
 
 /**
  * 数据集名校验（与 server/api/datasets.py 的 _check_name 同源：字符集同 EXP_NAME_RE
@@ -54,6 +74,17 @@ export function experimentName(modelStem: string): string {
 
 export function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * 随机十六进制串（小写，定长）。crypto.randomUUID 只在 secure context 存在
+ * （localhost 算，局域网 http 不算），getRandomValues 则到处可用——统一走后者。
+ * 消费方：上传会话 ID（ds-xxxxxxxx）、隐藏实验名的随机后缀等
+ */
+export function randomHex(len: number): string {
+  const bytes = new Uint8Array(Math.ceil(len / 2))
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('').slice(0, len)
 }
 
 /**

@@ -39,7 +39,17 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     if paths.STATIC_DIR.is_dir():
-        app.mount("/", StaticFiles(directory=paths.STATIC_DIR, html=True), name="static")
+        # HTML 入口禁缓存（no-cache：可缓存但必须带条件请求重新验证）：前端每次构建
+        # 产物哈希都会变，若浏览器启发式缓存了 index.html，会继续引用已被新构建清掉的
+        # 旧哈希 JS，出现「改了没生效」的假象；带哈希的 assets 长缓存没有问题
+        class _NoCacheHTML(StaticFiles):
+            def file_response(self, *args, **kwargs):
+                response = super().file_response(*args, **kwargs)
+                if response.media_type == "text/html":
+                    response.headers["cache-control"] = "no-cache"
+                return response
+
+        app.mount("/", _NoCacheHTML(directory=paths.STATIC_DIR, html=True), name="static")
     return app
 
 

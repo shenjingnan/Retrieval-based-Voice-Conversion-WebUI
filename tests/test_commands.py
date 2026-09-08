@@ -300,3 +300,12 @@ def test_default_batch_size_note_no_gpu(monkeypatch):
     assert commands.default_batch_size_note(1) == (
         "batch_size 未指定，按设备默认使用 1（无可用显卡）"
     )
+
+
+def test_build_separate_cmd_snapshot():
+    # 数据集人声分离（tools/vocal_dataset.py）；中文 label 白名单来自
+    # server.api.datasets.SEPARATION_MODELS，不含 shell 元字符
+    from server.commands import build_separate_cmd
+
+    cmd = build_separate_cmd("datasets/a", "datasets/a_vocals", "去伴奏")
+    assert cmd == f'"{PY}" -m tools.vocal_dataset "datasets/a" "datasets/a_vocals" --model "去伴奏"'

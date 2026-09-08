@@ -298,13 +298,20 @@ class MSSTBatchSeparator:
         if self.output_format not in {"wav", "flac", "mp3", "m4a"}:
             raise ValueError("Unsupported output format: %s" % output_format)
         desired_root = clean_path(desired_root)
-        secondary_root = clean_path(secondary_root)
-        if not desired_root or not secondary_root:
+        if not desired_root:
             raise ValueError("输出文件夹不能为空")
         self.desired_root = os.path.abspath(desired_root)
-        self.secondary_root = os.path.abspath(secondary_root)
         os.makedirs(self.desired_root, exist_ok=True)
-        os.makedirs(self.secondary_root, exist_ok=True)
+        # secondary_root=None：只落盘目标 stem，伴奏残余不编码不落盘（数据集人声分离
+        # 的产物是训练集，用不到伴奏，见 tools/vocal_dataset.py）。None 与空串区分：
+        # 空串仍视为调用方错误，不让漏传静默变成丢弃
+        self.secondary_root = None
+        if secondary_root is not None:
+            secondary = clean_path(secondary_root)
+            if not secondary:
+                raise ValueError("输出文件夹不能为空")
+            self.secondary_root = os.path.abspath(secondary)
+            os.makedirs(self.secondary_root, exist_ok=True)
 
         model_path = weight_pymss_root / spec.model_file
         config_path = weight_pymss_root / spec.config_file
@@ -414,19 +421,20 @@ class MSSTBatchSeparator:
         inference_started = time.perf_counter()
         results = self.separator.separate(mix, pbar=False)
         inference_seconds = time.perf_counter() - inference_started
-        missing = {
-            self.spec.desired_stem,
-            self.spec.secondary_stem,
-        }.difference(results)
+        # secondary_root=None（只落盘目标 stem）时不再要求伴奏 stem 存在
+        save_stems = [self.spec.desired_stem]
+        if self.secondary_root is not None:
+            save_stems.append(self.spec.secondary_stem)
+        missing = set(save_stems).difference(results)
         if missing:
             raise RuntimeError("模型缺少输出 stem: %s" % ", ".join(sorted(missing)))
-        for stem in (self.spec.desired_stem, self.spec.secondary_stem):
+        for stem in save_stems:
             if not np.isfinite(np.asarray(results[stem])).all():
                 raise FloatingPointError("模型输出包含 NaN/Inf: %s" % stem)
 
         file_stem = Path(input_path).stem
         encode_started = time.perf_counter()
-        futures = (
+        futures = [
             self._save_pool.submit(
                 self._save_output,
                 results[self.spec.desired_stem],
@@ -434,16 +442,19 @@ class MSSTBatchSeparator:
                 self.desired_root,
                 file_stem,
                 self.spec.desired_suffix,
-            ),
-            self._save_pool.submit(
-                self._save_output,
-                results[self.spec.secondary_stem],
-                sample_rate,
-                self.secondary_root,
-                file_stem,
-                self.spec.secondary_suffix,
-            ),
-        )
+            )
+        ]
+        if self.secondary_root is not None:
+            futures.append(
+                self._save_pool.submit(
+                    self._save_output,
+                    results[self.spec.secondary_stem],
+                    sample_rate,
+                    self.secondary_root,
+                    file_stem,
+                    self.spec.secondary_suffix,
+                )
+            )
         wait(futures)
         outputs = [future.result() for future in futures]
         encode_seconds = time.perf_counter() - encode_started
