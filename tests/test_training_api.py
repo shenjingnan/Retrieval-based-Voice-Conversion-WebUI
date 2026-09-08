@@ -72,7 +72,7 @@ class StubTaskManager:
         return True
 
 
-def _snapshot(task_id, name="fit", state="running", progress=None, error=None, logs=()):
+def _snapshot(task_id, name="fit", state="running", progress=None, error=None, logs=(), current_cmd=None):
     return {
         "id": task_id,
         "name": name,
@@ -80,6 +80,7 @@ def _snapshot(task_id, name="fit", state="running", progress=None, error=None, l
         "progress": progress,
         "error": error,
         "cmds": ["cmd"],
+        "current_cmd": current_cmd,
         "log_path": "log-path",
         "created_at": 1.0,
         "started_at": 2.0,
@@ -290,8 +291,11 @@ def test_pipeline_builds_all_steps_in_one_task(stub, client, monkeypatch, tmp_pa
     # fitprep 子进程——任务级 setup 在首个 cmd 前执行，拿去校验会误判新实验（见 fitprep 时序）
     assert call["setup"] is not None
     assert call["setup"]() == []
-    # 前端进度条需要 total_epoch：任务元数据随创建登记
-    assert training._TASK_META["task-1"] == {"total_epoch": 20}
+    # 前端进度条需要 total_epoch；加权进度需要 stages 表（与 cmds 等长）
+    assert training._TASK_META["task-1"] == {
+        "total_epoch": 20,
+        "pipeline_stages": ["preprocess", "preprocess", "extract", "extract", "fit", "fit", "index"],
+    }
 
 
 def test_pipeline_without_f0_skips_f0_cmd(stub, client, monkeypatch, tmp_path):
@@ -943,3 +947,111 @@ def test_lifespan_disposes_task_manager_on_shutdown(monkeypatch):
     with TestClient(create_app()):
         assert calls == []  # 启动阶段不清理
     assert calls == [True]
+
+
+# ---------------------------------------------------------------------------
+# pipeline 全流程加权进度（单一刻度单调递增，阶段切换不再归零）
+# ---------------------------------------------------------------------------
+
+PIPELINE_STAGES = ["preprocess", "preprocess", "extract", "extract", "fit", "fit", "index"]
+
+
+def test_pipeline_progress_weighted_across_stages(stub, client):
+    """切分段：base 0 + 阶段内进度 × 5%。"""
+    stub.snapshots["task-1"] = _snapshot(
+        "task-1", name="pipeline", logs=["[数据切分] 进度：1/2 | 9.wav"], current_cmd=1
+    )
+    training._TASK_META["task-1"] = {
+        "total_epoch": 20,
+        "pipeline_stages": list(PIPELINE_STAGES),
+    }
+
+    body = client.get("/api/tasks/task-1").json()
+
+    assert body["progress"] == pytest.approx(0.05 * 0.5)
+    assert body["current"] == "9.wav"
+
+
+def test_pipeline_progress_fit_segment_starts_at_20_percent(stub, client):
+    """训练段开始：base = 切分 5% + 提取 15% = 20%，epoch 进度在剩余 75% 里爬升，
+    不再从 0 归零（epoch1 0% → 0.2；epoch 11 50% → 0.2 + 0.75 × (10.5/20)）。"""
+    training._TASK_META["task-1"] = {
+        "total_epoch": 20,
+        "pipeline_stages": list(PIPELINE_STAGES),
+    }
+
+    stub.snapshots["task-1"] = _snapshot(
+        "task-1",
+        name="pipeline",
+        logs=["[数据切分] 进度：1/1 | 9.wav", "INFO:mi-test:Training epoch: 1 [0%]"],
+        current_cmd=6,
+    )
+    body = client.get("/api/tasks/task-1").json()
+    assert body["progress"] == pytest.approx(0.20)
+    assert body["current"] is None
+
+    stub.snapshots["task-1"] = _snapshot(
+        "task-1",
+        name="pipeline",
+        logs=["INFO:mi-test:训练轮次：11 [50%]"],
+        current_cmd=6,
+    )
+    body = client.get("/api/tasks/task-1").json()
+    assert body["progress"] == pytest.approx(0.20 + 0.75 * (10.5 / 20))
+
+
+def test_pipeline_progress_is_monotonic_across_f0_batches(stub, client):
+    """F0 多批次每批 done/total 从低处重新计数：单调钳位不让 bar 倒退。"""
+    training._TASK_META["task-1"] = {
+        "total_epoch": 20,
+        "pipeline_stages": list(PIPELINE_STAGES),
+    }
+    stub.snapshots["task-1"] = _snapshot(
+        "task-1", name="pipeline", logs=["[F0提取] 进度：1/1 | a.wav"], current_cmd=3
+    )
+    first = client.get("/api/tasks/task-1").json()["progress"]
+    assert first == pytest.approx(0.05 + 0.15)  # 单文件批次直接满格
+
+    # 下一批重新从 1/2 计数：不钳位会倒退到 12.5%
+    stub.snapshots["task-1"] = _snapshot(
+        "task-1", name="pipeline", logs=["[F0提取] 进度：1/2 | b.wav"], current_cmd=3
+    )
+    second = client.get("/api/tasks/task-1").json()["progress"]
+    assert second == pytest.approx(first)
+
+
+def test_pipeline_progress_before_first_cmd_is_zero(stub, client):
+    training._TASK_META["task-1"] = {
+        "total_epoch": 20,
+        "pipeline_stages": list(PIPELINE_STAGES),
+    }
+    stub.snapshots["task-1"] = _snapshot("task-1", name="pipeline", logs=[], current_cmd=None)
+
+    body = client.get("/api/tasks/task-1").json()
+
+    assert body["progress"] == 0.0
+
+
+def test_pipeline_stage_table_registered_on_create(stub, client, monkeypatch, tmp_path):
+    """建任务即登记 stages 表（与 cmds 等长、if_f0=False 时少一段 extract）。"""
+    monkeypatch.setattr(training, "resolve_is_half", lambda: False)
+    monkeypatch.setattr(commands, "_resolve_device", lambda: "cpu")
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+
+    resp = client.post(
+        "/api/train/pipeline",
+        json={**FIT_BODY, "if_f0": False, "dataset_dir": str(dataset)},
+    )
+
+    assert resp.status_code == 200
+    meta = training._TASK_META[resp.json()["task_id"]]
+    assert meta["pipeline_stages"] == [
+        "preprocess",
+        "preprocess",
+        "extract",
+        "fit",
+        "fit",
+        "index",
+    ]
+    assert len(meta["pipeline_stages"]) == len(stub.created[0]["cmds"])

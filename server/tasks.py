@@ -70,6 +70,10 @@ class _Task:
         self.state = PENDING
         self.progress = None
         self.error = None
+        # 当前正在执行的子命令序号（1-based；None = 尚未启动任何 cmd）。pipeline
+        # 之类多 cmd 任务的消费者（前端步骤条阶段映射）靠它知道推进到哪一步；
+        # 终态保留最后执行过的序号，失败诊断可据此定位出错的 cmd
+        self.current_cmd = None
         self.created_at = time.time()
         self.started_at = None
         self.finished_at = None
@@ -251,6 +255,7 @@ class TaskManager:
             "progress": task.progress,
             "error": task.error,
             "cmds": list(task.cmds),
+            "current_cmd": task.current_cmd,
             "log_path": str(task.log_path),
             "created_at": task.created_at,
             "started_at": task.started_at,
@@ -283,6 +288,8 @@ class TaskManager:
                 if task.stop_event.is_set():  # 每个 cmd 起前都检查（pipeline 提前收尾）
                     self._finish(task, CANCELLED, None)
                     return
+                with self._lock:
+                    task.current_cmd = step
                 if task.truncate:
                     reader = TailReader(task.log_path)
                 # with：无论后续流程如何退出都关闭父进程侧的日志句柄

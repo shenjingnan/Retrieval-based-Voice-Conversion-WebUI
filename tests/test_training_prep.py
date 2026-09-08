@@ -16,6 +16,12 @@ from server.api.training import (
 ROOT = str(paths.ROOT)
 
 
+@pytest.fixture(autouse=True)
+def _logs_dir(monkeypatch, tmp_path):
+    """generate_filelist 会向 LOGS_DIR/mute 写静音资产：钉到 tmp，不污染真实仓库。"""
+    monkeypatch.setattr(paths, "LOGS_DIR", tmp_path / "logs")
+
+
 def _touch(path, name):
     path.mkdir(parents=True, exist_ok=True)
     (path / name).write_bytes(b"x")
@@ -299,3 +305,43 @@ def test_training_module_does_not_load_torch():
         [sys.executable, "-c", code], cwd=str(paths.ROOT), capture_output=True, text=True
     )
     assert out.returncode == 0, out.stderr
+
+
+# ---------------------------------------------------------------------------
+# mute 静音资产：缺失会让训练子进程加载数据集时崩溃（且流水线仍继续跑索引）
+# ---------------------------------------------------------------------------
+
+
+def test_generate_filelist_creates_mute_assets(monkeypatch, tmp_path):
+    exp = _make_exp(tmp_path, names=("a",))
+    generate_filelist(exp, "40k", "v2", True)
+
+    import wave
+
+    import numpy as np
+
+    mute_dir = paths.LOGS_DIR / "mute"
+    wav = mute_dir / "0_gt_wavs" / "mute40k.wav"
+    assert wav.is_file() and wav.stat().st_size > 44
+    with wave.open(str(wav)) as handle:
+        assert handle.getframerate() == 40000
+        assert handle.getnchannels() == 1
+    fea = np.load(mute_dir / "3_feature768" / "mute.npy")
+    assert fea.shape == (50, 768) and fea.dtype == np.float32
+    assert np.load(mute_dir / "2a_f0" / "mute.wav.npy").dtype == np.int64
+    assert np.load(mute_dir / "2b-f0nsf" / "mute.wav.npy").dtype == np.float32
+
+
+def test_generate_filelist_mute_assets_idempotent_and_per_version(monkeypatch, tmp_path):
+    """幂等：重写 filelist 不重新生成；v1 用 256 维特征（与 v2 的 npy 分开）。"""
+    exp = _make_exp(tmp_path, names=("a",))
+    generate_filelist(exp, "48k", "v2", True)
+    wav = paths.LOGS_DIR / "mute" / "0_gt_wavs" / "mute48k.wav"
+    first_mtime = wav.stat().st_mtime_ns
+
+    generate_filelist(exp, "48k", "v2", True)
+    assert wav.stat().st_mtime_ns == first_mtime
+
+    exp_v1 = _make_exp(tmp_path, names=("a",), version="v1")
+    generate_filelist(exp_v1, "48k", "v1", True)
+    assert (paths.LOGS_DIR / "mute" / "3_feature256" / "mute.npy").is_file()

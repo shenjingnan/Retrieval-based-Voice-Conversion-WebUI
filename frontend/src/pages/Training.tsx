@@ -4,10 +4,11 @@
  * 前一步成功后解锁下一步，失败可重发同参数请求）。任务监视区由 useTask 驱动：
  * 进度条 + 当前文件 + 日志滚动区 + loss 曲线（内联 SVG，不引图表库）。
  */
-import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type MouseEvent as ReactMouseEvent } from 'react'
 import {
   CheckIcon,
   ChevronDownIcon,
+  CopyIcon,
   LoaderCircleIcon,
   PauseIcon,
   PlayIcon,
@@ -21,6 +22,7 @@ import { pickProductName, randomHex } from '@/lib/domain'
 import { errorMessage } from '@/lib/utils'
 import { ErrorDetail } from '@/components/ErrorDetail'
 import {
+  advancePipelineStages,
   INITIAL_STEP_STATES,
   pickRetryStep,
   resolveFailedStep,
@@ -144,35 +146,104 @@ function StepBadge({ state, index }: StepBadgeProps) {
   )
 }
 
-/** 日志滚动区：等宽 + 自动滚底，用户上滚时暂停（回到底部恢复） */
+/** 日志滚动区：等宽 + 自动滚底，用户上滚时暂停（回到底部恢复）；右上角悬浮复制
+ *  按钮（复制全部可见日志，成功后短暂变 ✓） */
 function LogPanel({ lines }: { lines: string[] }) {
   const ref = useRef<HTMLPreElement | null>(null)
   const stick = useRef(true)
+  const [copied, setCopied] = useState(false)
   useEffect(() => {
     const el = ref.current
     if (el === null || !stick.current) return
     el.scrollTop = el.scrollHeight
   }, [lines])
+
+  async function copyAll() {
+    const text = lines.join('\n')
+    try {
+      if (navigator.clipboard !== undefined) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        // 非 secure context（局域网 http 访问）没有 async Clipboard API：
+        // 退回隐藏 textarea + execCommand（已废弃但在所有浏览器仍可用）
+        const ta = document.createElement('textarea')
+        ta.value = text
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        ta.remove()
+      }
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    } catch {
+      // 复制失败（权限拒绝等）：不弹错误打断看日志的心流，按钮原样保留可重试
+    }
+  }
+
   return (
-    <pre
-      ref={ref}
-      onScroll={() => {
-        const el = ref.current
-        if (el === null) return
-        stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
-      }}
-      className="max-h-72 overflow-y-auto rounded-lg bg-muted p-3 font-mono text-xs leading-5 break-all whitespace-pre-wrap"
-    >
-      {lines.length > 0 ? lines.join('\n') : '（暂无日志输出）'}
-    </pre>
+    <div className="relative">
+      <pre
+        ref={ref}
+        onScroll={() => {
+          const el = ref.current
+          if (el === null) return
+          stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+        }}
+        className="max-h-72 overflow-y-auto rounded-lg bg-muted p-3 font-mono text-xs leading-5 break-all whitespace-pre-wrap"
+      >
+        {lines.length > 0 ? lines.join('\n') : '（暂无日志输出）'}
+      </pre>
+      <Button
+        variant="outline"
+        size="icon-sm"
+        className="absolute right-2 top-2 bg-background/80 backdrop-blur"
+        disabled={lines.length === 0}
+        aria-label="复制日志"
+        title="复制日志"
+        onClick={() => void copyAll()}
+      >
+        {copied ? <CheckIcon className="text-emerald-600" /> : <CopyIcon />}
+      </Button>
+    </div>
   )
 }
 
-/** loss 曲线：内联 SVG 双 polyline（loss_disc / loss_gen），共同 Y 轴范围 */
+/** loss 曲线：内联 SVG 双折线 + 悬浮十字线提示（第几个点 / 所属轮次 / 两条 loss 值）。
+ *  高亮点与提示用 HTML 绝对定位而不是 SVG 图元——svg 的 preserveAspectRatio=none
+ *  会在横向拉伸时把圆点变成椭圆；位置按 viewBox 百分比换算，与鼠标横坐标一致 */
 function LossChart({ points }: { points: LossPoint[] }) {
-  if (points.length < 2) {
+  const [hover, setHover] = useState<number | null>(null)
+  const svgRef = useRef<SVGSVGElement | null>(null)
+  // loss 每 200 步才记录一个点（train/train.py 的 log_interval；小数据集整场训练
+  // 可能只有一两个点）——单点构不成线，如实展示数值并说明节奏
+  if (points.length === 0) {
     return (
-      <p className="text-xs text-muted-foreground">暂无 loss 数据，训练产生日志后自动绘制</p>
+      <p className="text-xs text-muted-foreground">
+        暂无 loss 数据：训练开始后每 200 步记录一个点，产生日志后自动绘制
+      </p>
+    )
+  }
+  if (points.length === 1) {
+    const p = points[0]
+    return (
+      <div className="flex flex-col gap-1.5">
+        <div className="flex h-24 flex-wrap items-center justify-center gap-4 rounded-lg bg-muted text-xs text-muted-foreground">
+          <span className="inline-flex items-center gap-1 text-foreground">
+            <span className="inline-block size-2 rounded-full bg-chart-1" />
+            loss_disc {p.disc.toFixed(3)}
+          </span>
+          <span className="inline-flex items-center gap-1 text-foreground">
+            <span className="inline-block size-2 rounded-full bg-chart-2" />
+            loss_gen {p.gen.toFixed(3)}
+          </span>
+          {p.epoch !== null && <span>轮次 {p.epoch}</span>}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          已记录 1 个点（每 200 步记录一次）；当前数据量小、步数少，构不成曲线属正常，不影响训练
+        </p>
+      </div>
     )
   }
   const w = 320
@@ -187,30 +258,94 @@ function LossChart({ points }: { points: LossPoint[] }) {
   const span = max > min ? max - min : 1
   const x = (i: number) => pad + (i / (points.length - 1)) * (w - pad * 2)
   const y = (v: number) => h - pad - ((v - min) / span) * (h - pad * 2)
+  const leftPct = (i: number) => (x(i) / w) * 100
+  const topPct = (v: number) => (y(v) / h) * 100
   const polyline = (pick: (p: LossPoint) => number) =>
     points.map((p, i) => `${x(i).toFixed(2)},${y(pick(p)).toFixed(2)}`).join(' ')
+
+  function onMove(e: ReactMouseEvent<SVGSVGElement>) {
+    const rect = svgRef.current?.getBoundingClientRect()
+    if (rect === undefined || rect.width === 0) return
+    const frac = (e.clientX - rect.left) / rect.width
+    setHover(Math.max(0, Math.min(points.length - 1, Math.round(frac * (points.length - 1)))))
+  }
+
+  const hp = hover !== null ? points[hover] : null
+  // 提示框横向钳位，避免贴边溢出
+  const tipLeft = hover !== null ? Math.min(82, Math.max(18, leftPct(hover))) : 0
   return (
     <div className="flex flex-col gap-1.5">
-      <svg
-        viewBox={`0 0 ${w} ${h}`}
-        preserveAspectRatio="none"
-        className="h-24 w-full rounded-lg bg-muted"
-        role="img"
-        aria-label="loss 曲线"
-      >
-        <polyline
-          points={polyline((p) => p.disc)}
-          fill="none"
-          className="stroke-chart-1"
-          strokeWidth={1.5}
-        />
-        <polyline
-          points={polyline((p) => p.gen)}
-          fill="none"
-          className="stroke-chart-2"
-          strokeWidth={1.5}
-        />
-      </svg>
+      <div className="relative">
+        <svg
+          ref={svgRef}
+          viewBox={`0 0 ${w} ${h}`}
+          preserveAspectRatio="none"
+          className="h-24 w-full cursor-crosshair rounded-lg bg-muted"
+          role="img"
+          aria-label="loss 曲线"
+          onMouseMove={onMove}
+          onMouseLeave={() => setHover(null)}
+        >
+          <polyline
+            points={polyline((p) => p.disc)}
+            fill="none"
+            className="stroke-chart-1"
+            strokeWidth={1.5}
+          />
+          <polyline
+            points={polyline((p) => p.gen)}
+            fill="none"
+            className="stroke-chart-2"
+            strokeWidth={1.5}
+          />
+          {hp !== null && hover !== null && (
+            <line
+              x1={x(hover)}
+              x2={x(hover)}
+              y1={pad}
+              y2={h - pad}
+              className="stroke-border"
+              strokeWidth={1}
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+        {hp !== null && hover !== null && (
+          <>
+            <span
+              className="pointer-events-none absolute size-2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-background bg-chart-1"
+              style={{ left: `${leftPct(hover)}%`, top: `${topPct(hp.disc)}%` }}
+            />
+            <span
+              className="pointer-events-none absolute size-2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-background bg-chart-2"
+              style={{ left: `${leftPct(hover)}%`, top: `${topPct(hp.gen)}%` }}
+            />
+            <div
+              className="pointer-events-none absolute top-1 flex -translate-x-1/2 items-center gap-2 rounded-md border bg-background/95 px-2 py-1 text-[11px] shadow-sm"
+              style={{ left: `${tipLeft}%` }}
+            >
+              <span className="font-medium">
+                点 {hover + 1}/{points.length}
+              </span>
+              {hp.epoch !== null && (
+                <span>
+                  轮次 {hp.epoch}
+                  {hp.pct !== null ? ` (${hp.pct}%)` : ''}
+                </span>
+              )}
+              {hp.step !== null && <span>步 {hp.step}</span>}
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block size-1.5 rounded-full bg-chart-1" />
+                {hp.disc.toFixed(3)}
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block size-1.5 rounded-full bg-chart-2" />
+                {hp.gen.toFixed(3)}
+              </span>
+            </div>
+          </>
+        )}
+      </div>
       <div className="flex items-center gap-4 text-xs text-muted-foreground">
         <span className="inline-flex items-center gap-1">
           <span className="inline-block size-2 rounded-full bg-chart-1" />
@@ -444,6 +579,28 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
     const failedStep =
       task.status === 'failed' ? resolveFailedStep(task.error, task.cmds, null) : null
     setStepStates(settleSteps(stepStates, watched.step, task.status, failedStep))
+  }
+
+  // pipeline 运行中：按服务端「当前子命令」实时推进步骤条（render 期条件更新，与
+  // 上面的终态落定同一模式）。启动时乐观置态让全部步骤一起 loading；这里把已过
+  // 阶段校正回 success、未到阶段校正回 idle。每对 (taskId, currentCmd) 只应用一次：
+  // cmd 数组身份随每个 SSE 事件重建，靠 stagedCmdKey 挡住重复 setState
+  const [stagedCmdKey, setStagedCmdKey] = useState<string | null>(null)
+  if (
+    watched !== null &&
+    watched.step === 'pipeline' &&
+    !task.terminal &&
+    task.current_cmd !== null &&
+    task.cmds.length > 0
+  ) {
+    const key = `${watched.taskId}:${task.current_cmd}`
+    if (stagedCmdKey !== key) {
+      const next = advancePipelineStages(task.current_cmd, task.cmds)
+      if (next !== null && STEP_IDS.some((s) => next[s] !== stepStates[s])) {
+        setStagedCmdKey(key)
+        setStepStates(next)
+      }
+    }
   }
 
   // -- 完成区：产物确认 ------------------------------------------------------

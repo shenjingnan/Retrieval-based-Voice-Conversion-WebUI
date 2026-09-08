@@ -123,6 +123,30 @@ export function settleSteps(
 }
 
 /**
+ * pipeline 运行中按「当前子命令序号」推进步骤状态（数据源：server/tasks.py 快照的
+ * current_cmd，SSE 在切换子命令时补发 status 事件）：
+ * - 当前 cmd 之前的阶段 → success（串行语义：必然已完成）
+ * - 当前 cmd 所属阶段 → running
+ * - 尚未到达的阶段 → idle（校正启动时乐观置 running 的多余部分）
+ * currentCmd 越界 / cmd 无法识别返回 null（调用方保持现状不动）。
+ */
+export function advancePipelineStages(
+  currentCmd: number,
+  cmds: ReadonlyArray<string>,
+): Record<StepId, StepState> | null {
+  const cmd = cmds[currentCmd - 1]
+  if (cmd === undefined) return null
+  const stage = cmdToStep(cmd)
+  if (stage === null) return null
+  const idx = STEP_IDS.indexOf(stage)
+  const next = {} as Record<StepId, StepState>
+  for (const [i, s] of STEP_IDS.entries()) {
+    next[s] = i < idx ? 'success' : i === idx ? 'running' : 'idle'
+  }
+  return next
+}
+
+/**
  * 任务失败/停止后的「重试该步」目标：
  * - 分步：失败的那一步
  * - 一键：settleSteps 标记出的第一个失败/停止步骤（精确解析时即真实失败步骤；
