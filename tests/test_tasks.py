@@ -663,3 +663,33 @@ def test_module_does_not_load_torch_or_configs():
 
 def test_terminal_states_constant():
     assert TERMINAL_STATES == frozenset({"success", "failed", "cancelled"})
+
+
+# ---------------------------------------------------------------------------
+# current_cmd：pipeline 阶段映射的数据源
+# ---------------------------------------------------------------------------
+
+
+def test_current_cmd_follows_running_subcommand(factory, tmp_path):
+    """第一个 cmd 阻塞期间 current_cmd 停在 1；取消终态保留最后执行过的序号。"""
+    manager, _, _ = factory([FakeProcess(0, delay=10**6), FakeProcess(0)])
+    task_id = manager.create_task("multi", ["cmd-a", "cmd-b"], tmp_path / "multi.log")
+
+    wait_until(lambda: manager.get_task(task_id)["current_cmd"] == 1)
+    snapshot = manager.get_task(task_id)
+    assert snapshot["state"] == "running"
+    assert snapshot["cmds"][snapshot["current_cmd"] - 1] == "cmd-a"
+
+    manager.cancel(task_id)
+    wait_until(lambda: manager.get_task(task_id)["state"] == "cancelled")
+    assert manager.get_task(task_id)["current_cmd"] == 1  # 诊断值：出错时停在第几步
+
+
+def test_current_cmd_keeps_last_index_after_success(factory, tmp_path):
+    """成功终态 current_cmd = 最后启动的 cmd 序号（消费方按 state 判成功，序号仅存档）。"""
+    manager, _, _ = factory([FakeProcess(0), FakeProcess(0)])
+    task_id = manager.create_task("multi", ["cmd-a", "cmd-b"], tmp_path / "multi.log")
+
+    wait_until(lambda: manager.get_task(task_id)["state"] == "success")
+
+    assert manager.get_task(task_id)["current_cmd"] == 2

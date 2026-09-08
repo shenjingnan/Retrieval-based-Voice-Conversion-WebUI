@@ -15,3 +15,4 @@ assets/
 logs
 datasets/
 .model-downloads/
+.DS_Store

@@ -222,9 +222,55 @@ def _stems(directory: Path) -> set:
     return {name.split(".")[0] for name in os.listdir(directory)}
 
 
+def _ensure_mute_assets(sr: SampleRate, version: str) -> None:
+    """补齐 mute 行引用的全局静音资产（logs/mute/ 下 1 个静音 wav + 3 个零值 npy）。
+
+    filelist 末尾的 2 条 mute 行教会模型「静音不发声」，train/data_utils 会
+    getsize 那个 wav 并 np.load 三个 npy——缺任何一个，训练子进程在加载数据集时
+    就会 FileNotFoundError 崩溃，而流水线仍会继续跑索引，造成「看起来成功、实际
+    没训」的假象。旧版 webui 同样只引用不生成（上游靠历史目录兜底），这是移植
+    缺口，这里补上。幂等：资产齐备时跳过。"""
+    import wave
+
+    import numpy as np
+
+    mute_dir = paths.LOGS_DIR / "mute"
+    wav_path = mute_dir / "0_gt_wavs" / ("mute%s.wav" % sr)
+    feature_path = mute_dir / ("3_feature%s" % FEATURE_DIM[version]) / "mute.npy"
+    f0_path = mute_dir / "2a_f0" / "mute.wav.npy"
+    f0nsf_path = mute_dir / "2b-f0nsf" / "mute.wav.npy"
+    if (
+        wav_path.is_file()
+        and wav_path.stat().st_size > 44  # 至少容得下 wav 头（空壳视为缺失重建）
+        and feature_path.is_file()
+        and f0_path.is_file()
+        and f0nsf_path.is_file()
+    ):
+        return
+
+    # 静音 wav：0.4 秒 16bit 单声道，stdlib wave 直写（服务进程保持 torch-free）
+    sample_rate = int(sr[:-1]) * 1000  # "40k" → 40000
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(wav_path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(sample_rate)
+        handle.writeframes(b"\x00\x00" * int(sample_rate * 0.4))
+
+    # 特征/音高占位 npy：全零 50 帧（get_audio_text_pair 会把各模态裁到对齐长度）
+    frames = 50
+    feature_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(feature_path, np.zeros((frames, FEATURE_DIM[version]), dtype="float32"))
+    f0_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(f0_path, np.zeros(frames, dtype="int64"))
+    f0nsf_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(f0nsf_path, np.zeros(frames, dtype="float32"))
+
+
 def generate_filelist(exp_dir: Path, sr: SampleRate, version: str, if_f0: bool) -> None:
     """四目录 stem 交集 → filelist.txt（末尾追加 2 条 mute 行，shuffle 后写入）。"""
     exp_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_mute_assets(sr, version)  # mute 行引用的资产必须先落地（见函数 docstring）
     gt_wavs_dir = exp_dir / "0_gt_wavs"
     feature_dir = exp_dir / _feature_dir_name(version)
     if if_f0:
@@ -551,18 +597,26 @@ def start_pipeline(body: PipelineBody):
 
     cmds = [build_preprocess_cmd(dataset_dir, SR_DICT[sr], n_p, exp_name, NOPARALLEL, PREPROCESS_PER)]
     cmds.append(build_precheck_cmd(exp_name))
+    # 每条 cmd 的阶段归属表（与 cmds 等长）：_progress_state 据此把 current_cmd
+    # 映射到加权进度的阶段（前端步骤条的阶段映射用各自的命令串标记，互不依赖）
+    stages = ["preprocess", "preprocess"]
     if body.if_f0:
         cmds.append(build_extract_f0_cmd(exp_name, n_p, f0_method))
+        stages.append("extract")
     cmds.append(build_extract_hubert_cmd(exp_name, version, resolve_is_half()))
+    stages.append("extract")
     cmds.append(build_fitprep_cmd(exp_name, sr, version, body.if_f0))
+    stages.append("fit")
     cmds.append(_fit_cmd(body, sr, version, batch_size))
+    stages.append("fit")
     cmds.append(build_index_cmd(exp_name, version, os.cpu_count()))
+    stages.append("index")
     return _create(
         "pipeline",
         cmds,
         _task_log(exp_name, "pipeline_task.log"),
         setup=_pipeline_notice_setup(batch_note),
-        meta={"total_epoch": body.total_epoch},
+        meta={"total_epoch": body.total_epoch, "pipeline_stages": stages},
     )
 
 
@@ -586,15 +640,20 @@ def _progress_state(snapshot: dict) -> dict:
     返回 {"progress": float | None, "current": str | None}：
 
     - success → 1.0（index 等秒级阶段没有过程行，在这里收敛为完成）
-    - fit/pipeline（_TASK_META 登记 total_epoch）且缓冲里有 epoch 行 → 按训练进度换算，
+    - pipeline（_TASK_META 登记 pipeline_stages）→ 全流程加权进度（见
+      _pipeline_progress_state），单一刻度单调递增，阶段切换不再归零
+    - fit（登记 total_epoch）且缓冲里有 epoch 行 → 按训练进度换算，
       训练段没有「当前文件」语义
-    - 其余（preprocess/extract/index，或 pipeline 的切分/提取段）→ 用脚本自身的进度行
+    - 其余（preprocess/extract/index）→ 用脚本自身的进度行
       （design §3.5）换算 done/total，并带上当前文件名
     - 都没有锚点 → 透传 task.progress 原值
     """
     if snapshot["state"] == SUCCESS:
         return {"progress": 1.0, "current": None}
     meta = _TASK_META.get(snapshot["id"]) or {}
+    stages = meta.get("pipeline_stages")
+    if stages:
+        return _pipeline_progress_state(snapshot, meta, stages)
     total_epoch = meta.get("total_epoch")
     if total_epoch is not None:
         for line in reversed(snapshot["logs"]):
@@ -608,6 +667,58 @@ def _progress_state(snapshot: dict) -> dict:
             progress = parsed["done"] / parsed["total"]
             return {"progress": max(0.0, min(1.0, progress)), "current": parsed["current"]}
     return {"progress": snapshot["progress"], "current": None}
+
+
+# pipeline 全流程进度的阶段权重（展示启发值，总和 1）：训练占绝对大头，切分/提取
+# 在 CPU 上也可能吃时间故给 extract 15%；索引秒级。只用于 pipeline，分步任务保持
+# 「进度 = 本阶段 done/total」的原始语义
+_PIPELINE_STAGE_WEIGHTS = {"preprocess": 0.05, "extract": 0.15, "fit": 0.75, "index": 0.05}
+
+
+def _pipeline_progress_state(snapshot: dict, meta: dict, stages: list) -> dict:
+    """pipeline 的全流程加权进度：已完成阶段的权重 + 当前阶段内进度 × 阶段权重。
+
+    - 阶段归属来自建任务时随 cmds 一起登记的 stages 表（与 cmds 等长），配合快照
+      的 current_cmd（1-based）定位当前阶段——阶段切换不再让 bar 归零重爬
+    - 单调钳位：F0 提取是多进程分批跑的，每批的 done/total 从低处重新计数，不钳位
+      的话 bar 会在批间抖动。读写竞态最坏丢一次 max，下一次读即恢复，无锁必要
+    - current 沿用最近的阶段进度行文件名（训练段无文件语义，为 None）
+    """
+    current_cmd = snapshot.get("current_cmd")
+    if current_cmd is None:
+        return {"progress": 0.0, "current": None}
+    idx = min(current_cmd, len(stages)) - 1
+    stage = stages[idx]
+    # 回溯到当前阶段的首条 cmd（同阶段可占多条 cmd，如 fitprep + train.py 都属
+    # fit）：base 只累加该阶段之前已完成阶段的权重，否则当前阶段的权重会被自己
+    # 吃进 base（fit 段直接顶到 95%）
+    stage_start = idx
+    while stage_start > 0 and stages[stage_start - 1] == stage:
+        stage_start -= 1
+    base = sum(_PIPELINE_STAGE_WEIGHTS[s] for s in dict.fromkeys(stages[:stage_start]))
+    fraction = 0.0
+    current = None
+    if stage == "fit":
+        total_epoch = meta.get("total_epoch")
+        if total_epoch:
+            for line in reversed(snapshot["logs"]):
+                parsed = parse_train_line(line)
+                if parsed and "epoch" in parsed:
+                    fraction = ((parsed["epoch"] - 1) + parsed["pct"] / 100.0) / total_epoch
+                    break
+    else:
+        for line in reversed(snapshot["logs"]):
+            parsed = parse_stage_progress_line(line)
+            if parsed and parsed["total"] > 0:
+                fraction = parsed["done"] / parsed["total"]
+                current = parsed["current"]
+                break
+    progress = base + max(0.0, min(1.0, fraction)) * _PIPELINE_STAGE_WEIGHTS[stage]
+    last = meta.get("last_pipeline_progress")
+    if last is not None:
+        progress = max(progress, last)
+    meta["last_pipeline_progress"] = progress
+    return {"progress": max(0.0, min(1.0, progress)), "current": current}
 
 
 def _progress_of(snapshot: dict):
@@ -714,6 +825,7 @@ def _task_event_stream(task_id: str, cursor: int):
         if snapshot["state"] not in TERMINAL_STATES:  # 已终态只发下面那条终态 status
             yield _sse_event("status", initial)
         last_progress = {key: initial[key] for key in ("progress", "current")}
+        last_current_cmd = snapshot.get("current_cmd")
         last_sent = time.monotonic()
         while True:
             fetched = task_manager.read_logs_since(task_id, cursor)
@@ -723,6 +835,19 @@ def _task_event_stream(task_id: str, cursor: int):
             lines, cursor = fetched
             if lines:
                 yield _sse_event("log", {"lines": list(lines), "seq": cursor})
+                last_sent = time.monotonic()
+
+            # current_cmd 变化（pipeline 切换子命令）必须补发 status：中途只有
+            # log/progress 事件在飞，而它们不携带 cmds/current_cmd——前端步骤条的
+            # 阶段映射靠这个切换信号推进，漏发会让步骤条冻结在上一阶段。
+            # 同步重置 last_progress：status 载荷里已含本次进度，避免下轮重复推送
+            if snapshot.get("current_cmd") != last_current_cmd:
+                last_current_cmd = snapshot.get("current_cmd")
+                progress_now = _progress_state(snapshot)
+                last_progress = {
+                    key: progress_now[key] for key in ("progress", "current")
+                }
+                yield _sse_event("status", _status_payload(snapshot))
                 last_sent = time.monotonic()
 
             progress_state = _progress_state(snapshot)
