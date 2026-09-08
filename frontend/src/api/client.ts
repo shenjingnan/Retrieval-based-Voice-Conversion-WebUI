@@ -70,6 +70,8 @@ export interface DatasetSummary {
   total_bytes: number
   /** 秒；时长探测全失败（含空数据集）为 null，前端显示「未知」而非误导性的 0 秒 */
   total_duration: number | null
+  /** 人声分离的源数据集名；非衍生数据集为 null（.meta 衍生标记缺失/损坏也按 null） */
+  derived_from: string | null
 }
 
 /** GET /api/datasets/{name}：概览字段 + files 明细（音频文件，按名排序） */
@@ -100,6 +102,24 @@ export interface UploadResult {
 export interface DeleteDatasetResult {
   deleted: boolean
   failed_files: string[]
+}
+
+/**
+ * POST /api/datasets/{name}/separate 的返回体：分离任务已创建（与训练共用全局互斥，
+ * 冲突为 409）。output_dataset 恒为 {name}_vocals，前端在任务成功后按名刷新并选中它。
+ */
+export interface SeparateDatasetResult {
+  task_id: string
+  output_dataset: string
+  output_path: string
+}
+
+/**
+ * DELETE /api/datasets/{name}/files/{filename} 的返回体：删除数据集内的单个音频文件
+ * （训练任务进行中 409 拒删，与整目录删除同一互斥口径）。
+ */
+export interface DeleteDatasetFileResult {
+  deleted: boolean
 }
 
 /**
@@ -207,6 +227,28 @@ export const api = {
       for (const f of files) form.append('files', f, f.name)
       xhr.send(form)
     }),
+
+  /**
+   * 发起人声分离：datasets/{name}/ → 衍生数据集 {name}_vocals/（仅人声 stem，伴奏
+   * 丢弃）。与训练共用全局互斥（409）；产物已存在的文件由 runner 幂等跳过，重发即续跑。
+   * model 省略取后端默认（去伴奏）；可选值见 domain.ts 的 SEPARATION_MODELS。
+   * files 提供时只分离这些文件（逐文件分离），省略 = 整目录。
+   */
+  separateDataset: (name: string, model?: string, files?: string[]): Promise<SeparateDatasetResult> =>
+    postJson(`/api/datasets/${encodeURIComponent(name)}/separate`, {
+      ...(model === undefined ? {} : { model }),
+      ...(files === undefined ? {} : { files }),
+    }),
+
+  /**
+   * 删除数据集内的单个音频文件（上传错了就地纠错）。filename 经 encodeURIComponent
+   * 编码（服务端文件名允许空格/中文）；训练任务进行中后端 409 拒删。
+   */
+  deleteDatasetFile: (name: string, filename: string): Promise<DeleteDatasetFileResult> =>
+    fetch(
+      `/api/datasets/${encodeURIComponent(name)}/files/${encodeURIComponent(filename)}`,
+      { method: 'DELETE' },
+    ).then((r) => handle<DeleteDatasetFileResult>(r)),
 
   // -- 训练：4 步 + 一键（字段子集见 server/api/training.py 各 Body 模型） --------
 

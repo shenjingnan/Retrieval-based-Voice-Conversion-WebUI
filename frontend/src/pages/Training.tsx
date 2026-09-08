@@ -17,8 +17,7 @@ import {
 import { api, type ModelVersion, type SampleRate, type TaskCreated, type TrainF0Method, type TrainParams } from '@/api/client'
 import { DatasetPicker } from '@/components/DatasetPicker'
 import { useTask, type LossPoint } from '@/hooks/useTask'
-import { DATASET_BAD_RE, EXP_NAME_RE, pickProductName } from '@/lib/domain'
-import { COLLAPSIBLE_TRIGGER_CLASS } from '@/lib/ui'
+import { pickProductName, randomHex } from '@/lib/domain'
 import { errorMessage } from '@/lib/utils'
 import { ErrorDetail } from '@/components/ErrorDetail'
 import {
@@ -34,7 +33,6 @@ import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
@@ -93,13 +91,6 @@ const STEP_TITLES: Record<WatchedStep, string> = {
   fit: '训练',
   index: '建立索引',
   pipeline: '一键训练',
-}
-
-const STEP_ACTIONS: Record<StepId, string> = {
-  preprocess: '开始切分',
-  extract: '开始提取',
-  fit: '开始训练',
-  index: '建立索引',
 }
 
 const STEP_STARTERS: Record<StepId, (p: TrainParams) => Promise<TaskCreated>> = {
@@ -278,14 +269,10 @@ export interface TrainingPageProps {
 export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   // -- 表单（基础） ---------------------------------------------------------
   const [expName, setExpName] = useState('')
-  // 数据集来源：pick = 服务器数据集下拉/上传（DatasetPicker，主控件）；
-  // manual = 手填服务器路径（数据已在 GPU 服务器上时的兜底）。两个来源各自记忆，
-  // 来回切换不丢已填内容
-  const [datasetSource, setDatasetSource] = useState<'pick' | 'manual'>('pick')
+  // 参考音频唯一来源：DatasetPicker（下拉选已有 / 浏览器上传），路径由后端下发
   const [pickedPath, setPickedPath] = useState('')
-  const [manualDir, setManualDir] = useState('')
-  // 向导其余逻辑只认 dataset_dir 字符串：按来源派生，提交参数不区分来源
-  const datasetDir = datasetSource === 'pick' ? pickedPath : manualDir
+  // 向导其余逻辑只认 dataset_dir 字符串
+  const datasetDir = pickedPath
   // -- 表单（高级，默认值对齐 webui / server/api/training.py） ----------------
   const [sr, setSr] = useState<SampleRate>('40k')
   const [ifF0, setIfF0] = useState(true)
@@ -335,24 +322,32 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   }, [])
 
   // -- 校验（派生） ---------------------------------------------------------
-  const expNameValid = expName !== '.' && expName !== '..' && EXP_NAME_RE.test(expName)
-  // pick 来源的路径由后端下发（数据集目录的绝对路径），天然合法，不跑字符集正则；
-  // manual 来源仍是用户手填，沿用后端 _check_dataset_dir 的同源字符校验
-  const datasetValid =
-    datasetSource === 'pick'
-      ? pickedPath.length > 0
-      : manualDir.length > 0 && !DATASET_BAD_RE.test(manualDir) && !manualDir.endsWith('\\')
+  // 实验名对用户隐藏（第一阶段）：不校验、不展示，提交前自动生成（见 currentParams）
+  // 路径由后端下发（参考音频目录的绝对路径），天然合法，不跑字符集正则；只要求已选择
+  const datasetValid = pickedPath.length > 0
   const epochsValid =
     totalEpoch >= 1 && saveEveryEpoch >= 1 && (batchSize === null || batchSize >= 1)
-  const formValid = expNameValid && datasetValid && epochsValid
+  const formValid = datasetValid && epochsValid
 
   // v1 没有 32k 档（server/api/training.py _normalize_sr，webui change_version19 语义）。
   // 分步模式下 preprocess 与 fit 必须用同一采样率，前端在提交前统一归一化
   const normalizedSr: SampleRate = version === 'v1' && sr === '32k' ? '40k' : sr
 
   function currentParams(): TrainParams {
+    // 实验名隐藏（第一阶段）：首次提交时生成 voice-月日时分-随机后缀 并记进 state。
+    // 必须记住而非每次现生成——分步模式的 4 个接口各自调一次 currentParams，若每次
+    // 随机会得到不同实验名，流程直接错乱（preprocess 写 logs/A，extract 读 logs/B）。
+    // 时间因子保证新实验不会续进旧目录（train.py 会从实验目录里已有的 G/D 权重自动
+    // 续训），随机后缀兜掉同分钟内重开的碰撞
+    let resolvedExpName = expName
+    if (resolvedExpName.length === 0) {
+      const now = new Date()
+      const pad = (n: number) => String(n).padStart(2, '0')
+      resolvedExpName = `voice-${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}-${randomHex(4)}`
+      setExpName(resolvedExpName)
+    }
     return {
-      exp_name: expName,
+      exp_name: resolvedExpName,
       dataset_dir: datasetDir,
       sr: normalizedSr,
       version,
@@ -368,6 +363,8 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
 
   const running = watched !== null && !task.terminal
   const busy = busyStep !== null
+  /** 参考音频上传队列在途（DatasetPicker 回报）：期间禁止启动训练 */
+  const [uploadBusy, setUploadBusy] = useState(false)
 
   // -- 启动任务 -------------------------------------------------------------
   /** 新任务启动时的公共复位：停止确认两段式状态、上一轮的完成区产物 */
@@ -474,14 +471,6 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   }, [indexDone, refreshProduct])
 
   // -- 渲染 ----------------------------------------------------------------
-  const expNameHint =
-    expName.length > 0 && !expNameValid
-      ? '实验名不能为空，且不得含空格、引号、反斜杠、$、反引号或路径分隔符'
-      : null
-  const datasetHint =
-    datasetSource === 'manual' && manualDir.length > 0 && !datasetValid
-      ? '路径不得含引号、$、反引号、换行，且不能以反斜杠结尾'
-      : null
   const epochsHint = !epochsValid
     ? totalEpoch < 1 || saveEveryEpoch < 1
       ? '总轮次与保存间隔都必须至少为 1'
@@ -491,13 +480,6 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   function cellState(key: StepId | 'config'): StepState {
     if (key === 'config') return formValid ? 'success' : 'idle'
     return stepStates[key]
-  }
-
-  /** 分步按钮可用性：前一步成功才解锁；失败步骤自身可重试（前置仍为 success） */
-  function stepEnabled(step: StepId): boolean {
-    if (!formValid || running || busy) return false
-    const idx = STEP_IDS.indexOf(step)
-    return idx === 0 || stepStates[STEP_IDS[idx - 1]] === 'success'
   }
 
   const taskFailed = task.terminal && task.status !== 'success'
@@ -519,9 +501,6 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
     <Card>
       <CardHeader>
         <CardTitle>训练</CardTitle>
-        <CardDescription>
-          上传音频或填写服务器数据集路径，配置实验后即可一键训练或分步执行。
-        </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-6">
         {/* 步骤条 */}
@@ -552,261 +531,165 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
           })}
         </ol>
 
-        {/* 表单：基础 */}
+        {/* 表单：基础。实验名对用户隐藏（第一阶段）：提交时自动生成随机标识，
+            训练完成后在完成区 / 模型管理页以产物名（{实验名}.pth）可见 */}
         <div className="flex flex-col gap-4">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="train-exp" className="text-sm font-medium">
-                实验名
-              </label>
-              <Input
-                id="train-exp"
-                value={expName}
-                onChange={(e) => setExpName(e.target.value)}
-                placeholder="如 my-voice"
-                aria-invalid={expNameHint !== null}
-              />
-              {expNameHint !== null && <p className="text-xs text-destructive">{expNameHint}</p>}
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium">数据集</span>
-              {/* 来源切换：pick 为主控件（上传/下拉），manual 为手填兜底 */}
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={datasetSource === 'pick' ? 'secondary' : 'outline'}
-                  onClick={() => setDatasetSource('pick')}
-                >
-                  选择 / 上传数据集
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={datasetSource === 'manual' ? 'secondary' : 'outline'}
-                  onClick={() => setDatasetSource('manual')}
-                >
-                  手动填服务器路径
-                </Button>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                {datasetSource === 'pick'
-                  ? '在服务器上选择已有数据集，或直接从浏览器上传音频自动创建'
-                  : '数据已在 GPU 服务器上时，直接填目录路径'}
-              </p>
-            </div>
-          </div>
+          <span className="text-sm font-medium">参考音频</span>
 
-          {datasetSource === 'pick' ? (
-            <DatasetPicker
-              selectedPath={pickedPath.length > 0 ? pickedPath : null}
-              onSelect={(ds) => setPickedPath(ds === null ? '' : ds.path)}
-              onUploaded={(r) => {
-                // 上传成功即把后端下发的绝对路径回填 dataset_dir：表单立即可提交。
-                // 本控件只在 pick 来源下渲染，无需再 setDatasetSource
-                setPickedPath(r.path)
-              }}
-              trainingRunning={running}
-            />
-          ) : (
-            <Collapsible defaultOpen>
-              {/* 触发器用字段名而非来源名：来源切换按钮已叫「手动填服务器路径」，
-                  同屏两个同名可点击元素会让人分不清哪个控制什么 */}
-              <CollapsibleTrigger className={COLLAPSIBLE_TRIGGER_CLASS}>
-                数据集路径
-                <ChevronDownIcon className="size-4 text-muted-foreground" />
-              </CollapsibleTrigger>
-              <CollapsibleContent className="flex flex-col gap-1.5 pt-4">
-                <Input
-                  id="train-dataset"
-                  aria-label="数据集路径"
-                  value={manualDir}
-                  onChange={(e) => setManualDir(e.target.value)}
-                  placeholder="服务器上的目录路径，如 /data/dataset"
-                  aria-invalid={datasetHint !== null}
-                />
-                {datasetHint !== null ? (
-                  <p className="text-xs text-destructive">{datasetHint}</p>
-                ) : (
-                  <p className="text-xs text-muted-foreground">
-                    服务器上的目录路径（浏览器无法选择远端目录）；目录内放要训练的人声 wav
-                  </p>
-                )}
-              </CollapsibleContent>
-            </Collapsible>
-          )}
+          <DatasetPicker
+            onSelect={(ds) => setPickedPath(ds === null ? '' : ds.path)}
+            onUploaded={(r) => {
+              // 上传成功即把后端下发的绝对路径回填 dataset_dir：表单立即可提交
+              setPickedPath(r.path)
+            }}
+            onUploadBusyChange={setUploadBusy}
+            trainingRunning={running}
+          />
         </div>
-
-        {/* 空状态引导（pick 来源的空态由 DatasetPicker 自带） */}
-        {datasetSource === 'manual' && manualDir.length === 0 && (
-          <p className="rounded-lg bg-muted p-3 text-xs text-muted-foreground">
-            还没有数据集：请先在服务器上准备一个文件夹，里面放若干人声 wav（建议 2
-            分钟以上、无伴奏无混响），把文件夹路径填到上方即可开始。
-          </p>
-        )}
-
-        {/* 表单：高级参数（折叠） */}
-        <Collapsible>
-          <CollapsibleTrigger className={COLLAPSIBLE_TRIGGER_CLASS}>
-            高级参数
-            <ChevronDownIcon className="size-4 text-muted-foreground" />
-          </CollapsibleTrigger>
-          <CollapsibleContent className="grid gap-4 pt-4 sm:grid-cols-2">
-            <div className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium">采样率</span>
-              <Select
-                items={SR_ITEMS}
-                value={sr}
-                onValueChange={(v) => applySelect(v, (value) => setSr(value as SampleRate))}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="40k">40k（推荐）</SelectItem>
-                  <SelectItem value="48k">48k</SelectItem>
-                  <SelectItem value="32k">32k</SelectItem>
-                </SelectContent>
-              </Select>
-              {normalizedSr !== sr && (
-                <p className="text-xs text-amber-600 dark:text-amber-400">
-                  v1 没有 32k 档，训练时将自动使用 40k
-                </p>
-              )}
-            </div>
-
-            <div className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium">提取音高（f0）</span>
-              <Select
-                items={IF_F0_ITEMS}
-                value={ifF0 ? '1' : '0'}
-                onValueChange={(v) => applySelect(v, (value) => setIfF0(value === '1'))}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="1">开启（歌声/变调推荐）</SelectItem>
-                  <SelectItem value="0">关闭（说话声更快）</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium">音高算法</span>
-              <Select
-                items={F0_METHOD_ITEMS}
-                value={f0Method}
-                disabled={!ifF0}
-                onValueChange={(v) => applySelect(v, (value) => setF0Method(value as TrainF0Method))}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="rmvpe">rmvpe（推荐）</SelectItem>
-                  <SelectItem value="pm">pm（最快，质量一般）</SelectItem>
-                </SelectContent>
-              </Select>
-              {!ifF0 && <p className="text-xs text-muted-foreground">已关闭音高提取，无需选择</p>}
-            </div>
-
-            <div className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium">模型版本</span>
-              <Select
-                items={VERSION_ITEMS}
-                value={version}
-                onValueChange={(v) => applySelect(v, (value) => setVersion(value as ModelVersion))}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="v2">v2（推荐）</SelectItem>
-                  <SelectItem value="v1">v1（兼容旧模型）</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            <NumberField
-              id="train-total-epoch"
-              label="总轮次（total_epoch）"
-              value={totalEpoch}
-              onChange={(value) => setTotalEpoch(value ?? 0)}
-            />
-            <NumberField
-              id="train-save-epoch"
-              label="保存间隔（save_every_epoch）"
-              value={saveEveryEpoch}
-              onChange={(value) => setSaveEveryEpoch(value ?? 0)}
-              hint="每多少轮保存一次检查点"
-            />
-            <NumberField
-              id="train-batch-size"
-              label="batch size"
-              value={batchSize}
-              onChange={(value) => {
-                batchSizeTouched.current = true
-                setBatchSize(value)
-              }}
-              placeholder="自动"
-              hint="按设备默认：显卡=显存GB÷2，CPU=1；显存不足就调小"
-            />
-            <div className="flex flex-col gap-1.5">
-              <span className="text-sm font-medium">逐轮保存权重</span>
-              <Select
-                items={SAVE_WEIGHTS_ITEMS}
-                value={saveEveryWeights ? '1' : '0'}
-                onValueChange={(v) => applySelect(v, (value) => setSaveEveryWeights(value === '1'))}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="0">关闭（只保存最终模型）</SelectItem>
-                  <SelectItem value="1">开启（每个保存间隔另存一份）</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </CollapsibleContent>
-        </Collapsible>
 
         {epochsHint !== null && <p className="text-xs text-destructive">{epochsHint}</p>}
 
-        {/* 启动按钮：一键 + 分步 */}
+        {/* 启动区：一键训练（高级设置收在其旁）+ 分步 */}
         <div className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <Button onClick={() => void startPipeline()} disabled={!formValid || running || busy}>
-              {busyStep === 'pipeline' && <LoaderCircleIcon className="animate-spin" />}
-              <PlayIcon />
-              一键训练
-            </Button>
-            <span className="text-xs text-muted-foreground">从数据切分到建立索引一次跑完</span>
-          </div>
-          <div className="flex flex-col gap-2">
-            <span className="text-sm font-medium">分步执行</span>
-            <div className="grid gap-2 sm:grid-cols-4">
-              {STEP_IDS.map((step) => {
-                const state = stepStates[step]
-                return (
-                  <Button
-                    key={step}
-                    variant="outline"
-                    onClick={() => void startStep(step)}
-                    disabled={!stepEnabled(step)}
-                  >
-                    {busyStep === step && <LoaderCircleIcon className="animate-spin" />}
-                    {state === 'failed' || state === 'skipped'
-                      ? `重试${STEP_TITLES[step]}`
-                      : STEP_ACTIONS[step]}
-                  </Button>
-                )
-              })}
+          <Collapsible>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                onClick={() => void startPipeline()}
+                disabled={!formValid || running || busy || uploadBusy}
+                title={uploadBusy ? '参考音频还在上传中，等全部完成再开始训练' : undefined}
+              >
+                {busyStep === 'pipeline' && <LoaderCircleIcon className="animate-spin" />}
+                <PlayIcon />
+                一键训练
+              </Button>
+              <CollapsibleTrigger className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm text-muted-foreground select-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none [&_svg]:transition-transform [&[aria-expanded=true]_svg]:rotate-180">
+                高级设置
+                <ChevronDownIcon className="size-4" />
+              </CollapsibleTrigger>
             </div>
-            <p className="text-xs text-muted-foreground">
-              按顺序执行：处理数据 → 特征提取 → 训练 → 建立索引；前一步成功后下一步解锁。
-            </p>
-          </div>
+            <CollapsibleContent>
+              <div className="grid gap-4 pt-4 sm:grid-cols-2">
+              <div className="flex flex-col gap-1.5">
+                <span className="text-sm font-medium">采样率</span>
+                <Select
+                  items={SR_ITEMS}
+                  value={sr}
+                  onValueChange={(v) => applySelect(v, (value) => setSr(value as SampleRate))}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="40k">40k（推荐）</SelectItem>
+                    <SelectItem value="48k">48k</SelectItem>
+                    <SelectItem value="32k">32k</SelectItem>
+                  </SelectContent>
+                </Select>
+                {normalizedSr !== sr && (
+                  <p className="text-xs text-amber-600 dark:text-amber-400">
+                    v1 没有 32k 档，训练时将自动使用 40k
+                  </p>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <span className="text-sm font-medium">提取音高（f0）</span>
+                <Select
+                  items={IF_F0_ITEMS}
+                  value={ifF0 ? '1' : '0'}
+                  onValueChange={(v) => applySelect(v, (value) => setIfF0(value === '1'))}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="1">开启（歌声/变调推荐）</SelectItem>
+                    <SelectItem value="0">关闭（说话声更快）</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <span className="text-sm font-medium">音高算法</span>
+                <Select
+                  items={F0_METHOD_ITEMS}
+                  value={f0Method}
+                  disabled={!ifF0}
+                  onValueChange={(v) => applySelect(v, (value) => setF0Method(value as TrainF0Method))}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="rmvpe">rmvpe（推荐）</SelectItem>
+                    <SelectItem value="pm">pm（最快，质量一般）</SelectItem>
+                  </SelectContent>
+                </Select>
+                {!ifF0 && <p className="text-xs text-muted-foreground">已关闭音高提取，无需选择</p>}
+              </div>
+
+              <div className="flex flex-col gap-1.5">
+                <span className="text-sm font-medium">模型版本</span>
+                <Select
+                  items={VERSION_ITEMS}
+                  value={version}
+                  onValueChange={(v) => applySelect(v, (value) => setVersion(value as ModelVersion))}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="v2">v2（推荐）</SelectItem>
+                    <SelectItem value="v1">v1（兼容旧模型）</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <NumberField
+                id="train-total-epoch"
+                label="总轮次（total_epoch）"
+                value={totalEpoch}
+                onChange={(value) => setTotalEpoch(value ?? 0)}
+              />
+              <NumberField
+                id="train-save-epoch"
+                label="保存间隔（save_every_epoch）"
+                value={saveEveryEpoch}
+                onChange={(value) => setSaveEveryEpoch(value ?? 0)}
+                hint="每多少轮保存一次检查点"
+              />
+              <NumberField
+                id="train-batch-size"
+                label="batch size"
+                value={batchSize}
+                onChange={(value) => {
+                  batchSizeTouched.current = true
+                  setBatchSize(value)
+                }}
+                placeholder="自动"
+                hint="按设备默认：显卡=显存GB÷2，CPU=1；显存不足就调小"
+              />
+              <div className="flex flex-col gap-1.5">
+                <span className="text-sm font-medium">逐轮保存权重</span>
+                <Select
+                  items={SAVE_WEIGHTS_ITEMS}
+                  value={saveEveryWeights ? '1' : '0'}
+                  onValueChange={(v) => applySelect(v, (value) => setSaveEveryWeights(value === '1'))}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="0">关闭（只保存最终模型）</SelectItem>
+                    <SelectItem value="1">开启（每个保存间隔另存一份）</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+
+          {epochsHint !== null && <p className="text-xs text-destructive">{epochsHint}</p>}
         </div>
 
         {/* 提交错误（400/409/网络失败等） */}

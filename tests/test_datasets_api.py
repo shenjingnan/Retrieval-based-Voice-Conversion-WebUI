@@ -917,3 +917,323 @@ def test_audio_duration_truncated_mp3_never_raises(tmp_path):
     result = _audio_duration(broken)
 
     assert result is None or isinstance(result, float)
+
+
+# ---------------------------------------------------------------------------
+# 人声分离：端点校验 / 任务创建 / 衍生标记（设计 docs/plans/2026-09-07-…-design.md）
+# ---------------------------------------------------------------------------
+
+
+def _make_dataset(name, files=("a.wav",)):
+    for file_name in files:
+        _write_wav(paths.DATASETS_DIR / name / file_name)
+
+
+def test_separate_creates_task_with_default_model(client, monkeypatch):
+    """默认模型去伴奏；命令 / 日志 / 衍生标记三处落点全部可核。"""
+    _make_dataset("alice")
+
+    from server.api import datasets as datasets_api
+
+    seen = {}
+
+    def fake_create(name, cmds, log_path, truncate=True, setup=None):
+        seen.update(name=name, cmds=list(cmds), log_path=Path(log_path))
+        return "task-1"
+
+    monkeypatch.setattr(datasets_api.task_manager, "create_task", fake_create)
+
+    resp = client.post("/api/datasets/alice/separate", json={})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["task_id"] == "task-1"
+    assert body["output_dataset"] == "alice_vocals"
+    assert body["output_path"] == str(paths.DATASETS_DIR / "alice_vocals")
+    # 任务命令：runner 入口 + 输入/输出目录 + 默认模型
+    assert seen["name"] == "separate"
+    cmd = seen["cmds"][0]
+    assert "-m tools.vocal_dataset" in cmd
+    assert '"%s"' % (paths.DATASETS_DIR / "alice") in cmd
+    assert '"%s"' % (paths.DATASETS_DIR / "alice_vocals") in cmd
+    assert '--model "去伴奏"' in cmd
+    # 任务日志在 .meta（数据集目录之外）
+    assert seen["log_path"].parent == paths.DATASETS_DIR / ".meta"
+    assert seen["log_path"].name == "alice.separate.log"
+    # 建任务即写衍生标记（失败重跑同样有血缘可展示）
+    marker = json.loads(
+        (paths.DATASETS_DIR / ".meta" / "alice_vocals.derived.json").read_text(encoding="utf8")
+    )
+    assert marker == {"source": "alice", "model": "去伴奏"}
+
+
+def test_separate_explicit_model_passthrough(client, monkeypatch):
+    _make_dataset("alice")
+
+    from server.api import datasets as datasets_api
+
+    seen = {}
+    monkeypatch.setattr(
+        datasets_api.task_manager,
+        "create_task",
+        lambda name, cmds, log_path, truncate=True, setup=None: seen.update(
+            cmds=list(cmds)
+        ) or "task-1",
+    )
+
+    resp = client.post("/api/datasets/alice/separate", json={"model": "去混响"})
+
+    assert resp.status_code == 200
+    assert '--model "去混响"' in seen["cmds"][0]
+    marker = json.loads(
+        (paths.DATASETS_DIR / ".meta" / "alice_vocals.derived.json").read_text(encoding="utf8")
+    )
+    assert marker["model"] == "去混响"
+
+
+def test_separate_unknown_model_returns_400(client):
+    _make_dataset("alice")
+
+    resp = client.post("/api/datasets/alice/separate", json={"model": "不存在的模型"})
+
+    assert resp.status_code == 400
+    assert "去伴奏" in resp.json()["detail"]  # 可选列表进 detail
+
+
+def test_separate_missing_dataset_returns_404(client):
+    assert client.post("/api/datasets/ghost/separate", json={}).status_code == 404
+
+
+def test_separate_invalid_name_returns_400(client):
+    assert client.post("/api/datasets/%2E%2E/separate", json={}).status_code == 400
+
+
+def test_separate_empty_dataset_returns_400(client):
+    (paths.DATASETS_DIR / "hollow").mkdir(parents=True)
+
+    resp = client.post("/api/datasets/hollow/separate", json={})
+
+    assert resp.status_code == 400
+    assert "没有可分离的音频文件" in resp.json()["detail"]
+
+
+def test_separate_conflict_maps_to_409(client, monkeypatch):
+    """与训练共用全局互斥：TaskConflictError → 409，文案原样透出。"""
+    _make_dataset("alice")
+
+    from server.api import datasets as datasets_api
+    from server.tasks import TaskConflictError
+
+    def conflicting_create(name, cmds, log_path, truncate=True, setup=None):
+        raise TaskConflictError("已有训练任务在运行（fit，id=t9），请等待完成或先停止")
+
+    monkeypatch.setattr(datasets_api.task_manager, "create_task", conflicting_create)
+
+    resp = client.post("/api/datasets/alice/separate", json={})
+
+    assert resp.status_code == 409
+    assert "已有训练任务在运行" in resp.json()["detail"]
+
+
+def test_list_and_detail_report_derived_from(client):
+    _make_dataset("alice")
+    _make_dataset("alice_vocals", files=("a_vocals.wav",))
+
+    from server.api import datasets as datasets_api
+
+    datasets_api._write_derived_marker("alice_vocals", "alice", "去伴奏")
+
+    listed = {d["name"]: d for d in client.get("/api/datasets").json()}
+    assert listed["alice"]["derived_from"] is None
+    assert listed["alice_vocals"]["derived_from"] == "alice"
+
+    detail = client.get("/api/datasets/alice_vocals").json()
+    assert detail["derived_from"] == "alice"
+
+
+def test_corrupt_derived_marker_reads_as_none(client):
+    """坏标记与坏时长侧车同一纪律：不可信即视为无标记，绝不 500。"""
+    _make_dataset("alice")
+    meta = paths.DATASETS_DIR / ".meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "alice.derived.json").write_text("{not-json", encoding="utf8")
+
+    data = client.get("/api/datasets").json()
+
+    assert data[0]["derived_from"] is None
+
+
+def test_delete_removes_marker_and_separate_log_of_deleted_name(client):
+    """清理范围是「以被删数据集自己的名字命名的」.meta 档案（时长侧车 / 衍生标记 /
+    分离日志）。衍生数据集 alice_vocals 是独立数据集：删源数据集 alice 不动它的
+    标记（血缘是历史事实），删它自己时才清自己的标记。"""
+    _make_dataset("alice")
+    _make_dataset("alice_vocals", files=("a_vocals.wav",))
+    meta = paths.DATASETS_DIR / ".meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "alice.separate.log").write_text("log", encoding="utf8")
+
+    from server.api import datasets as datasets_api
+
+    datasets_api._write_derived_marker("alice_vocals", "alice", "去伴奏")
+
+    resp = client.delete("/api/datasets/alice")
+
+    assert resp.status_code == 200
+    assert not (meta / "alice.separate.log").exists()  # 源的分离日志随源删除
+    assert (meta / "alice_vocals.derived.json").exists()  # 衍生标记不受牵连
+
+    resp = client.delete("/api/datasets/alice_vocals")
+
+    assert resp.status_code == 200
+    assert not (meta / "alice_vocals.derived.json").exists()  # 衍生删除时清自己的标记
+
+
+# ---------------------------------------------------------------------------
+# 单文件删除：就地纠错 / 互斥 / 空目录收敛
+# ---------------------------------------------------------------------------
+
+
+def test_delete_file_removes_file_and_sidecar_entry(client):
+    _make_dataset("alice", files=("a.wav", "b.wav"))
+    client.get("/api/datasets")  # 生成侧车
+
+    resp = client.delete("/api/datasets/alice/files/a.wav")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"deleted": True}
+    assert not (paths.DATASETS_DIR / "alice" / "a.wav").exists()
+    assert (paths.DATASETS_DIR / "alice" / "b.wav").exists()  # 其余文件不受牵连
+    sidecar = json.loads((paths.DATASETS_DIR / ".meta" / "alice.json").read_text(encoding="utf8"))
+    assert "a.wav" not in sidecar  # 时长缓存条目一并清
+    assert "b.wav" in sidecar
+
+
+def test_delete_last_file_removes_empty_dataset_and_meta(client):
+    """删到空 → 目录连同 .meta 档案一起移除，列表不留 0 文件空壳（与上传
+    「不留空目录」同一纪律）。"""
+    _make_dataset("alice", files=("a.wav",))
+
+    assert client.delete("/api/datasets/alice/files/a.wav").status_code == 200
+
+    assert not (paths.DATASETS_DIR / "alice").exists()
+    assert client.get("/api/datasets").json() == []
+
+
+def test_delete_file_missing_file_or_dataset_returns_404(client):
+    _make_dataset("alice", files=("a.wav",))
+
+    assert client.delete("/api/datasets/alice/files/ghost.wav").status_code == 404
+    assert client.delete("/api/datasets/ghost/files/a.wav").status_code == 404
+
+
+@pytest.mark.parametrize("bad", ["%2E%2E", ".hidden.wav"])
+def test_delete_file_invalid_names_rejected(client, bad):
+    """点开头文件不进列表（_iter_audio 口径），也不该能被删；`..` 防穿越。"""
+    _make_dataset("alice", files=("a.wav",))
+
+    assert client.delete(f"/api/datasets/alice/files/{bad}").status_code == 400
+
+
+def test_delete_file_blocked_while_task_active(client, monkeypatch):
+    _make_dataset("alice", files=("a.wav",))
+
+    from server.api import datasets as datasets_api
+
+    monkeypatch.setattr(
+        datasets_api.task_manager,
+        "list_tasks",
+        lambda: [{"id": "t1", "name": "preprocess", "state": "running"}],
+    )
+
+    resp = client.delete("/api/datasets/alice/files/a.wav")
+
+    assert resp.status_code == 409
+    assert (paths.DATASETS_DIR / "alice" / "a.wav").exists()  # 互斥拦截：文件原样保留
+
+
+def test_delete_file_with_unicode_and_space_name(client):
+    """上传允许空格/中文名（_safe_filename 保留），删除同口径放行。"""
+    _make_dataset("alice")
+    _write_wav(paths.DATASETS_DIR / "alice" / "中文 歌.wav")
+
+    resp = client.delete("/api/datasets/alice/files/%E4%B8%AD%E6%96%87%20%E6%AD%8C.wav")
+
+    assert resp.status_code == 200
+    assert not (paths.DATASETS_DIR / "alice" / "中文 歌.wav").exists()
+
+
+def test_separate_with_file_subset_builds_file_args(client, monkeypatch):
+    """逐文件分离：命令带 --file；字符校验 + 存在性校验 + 去重。"""
+    _make_dataset("alice", files=("a.wav", "b.wav"))
+
+    from server.api import datasets as datasets_api
+
+    seen = {}
+    monkeypatch.setattr(
+        datasets_api.task_manager,
+        "create_task",
+        lambda name, cmds, log_path, truncate=True, setup=None: seen.update(
+            cmds=list(cmds)
+        )
+        or "task-1",
+    )
+
+    resp = client.post(
+        "/api/datasets/alice/separate", json={"files": ["b.wav", "b.wav"]}
+    )
+
+    assert resp.status_code == 200
+    assert '--file "b.wav"' in seen["cmds"][0]  # 去重后只出现一次
+    assert "--file" not in seen["cmds"][0].split("--model")[1].split("--file")[0]
+
+
+def test_separate_file_subset_rejects_unknown_and_unsafe_names(client):
+    _make_dataset("alice", files=("a.wav",))
+
+    unknown = client.post(
+        "/api/datasets/alice/separate", json={"files": ["ghost.wav"]}
+    )
+    assert unknown.status_code == 400
+    assert "没有该音频文件" in unknown.json()["detail"]
+
+    # $ 反引号 引号 反斜杠：_safe_filename 放行它们，但它们会进 shell 命令，必须在此拦下
+    for bad in ["a$(x).wav", "a`x`.wav", 'a"b.wav', "a\\b.wav"]:
+        resp = client.post("/api/datasets/alice/separate", json={"files": [bad]})
+        assert resp.status_code == 400, bad
+        assert "文件名非法" in resp.json()["detail"]
+
+
+def test_file_content_serves_audio_with_media_type(client):
+    """试听端点：字节原样返回 + 按后缀给媒体类型。"""
+    _make_dataset("alice", files=("a.wav",))
+    payload = (paths.DATASETS_DIR / "alice" / "a.wav").read_bytes()
+
+    resp = client.get("/api/datasets/alice/files/a.wav/content")
+
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert resp.headers["content-type"].startswith("audio/wav")
+    # 允许内联播放（不设 attachment）
+    assert "attachment" not in resp.headers.get("content-disposition", "")
+
+
+def test_file_content_rejects_invalid_and_missing(client):
+    _make_dataset("alice", files=("a.wav",))
+
+    assert client.get("/api/datasets/alice/files/.hidden/content").status_code == 400
+    assert client.get("/api/datasets/alice/files/ghost.wav/content").status_code == 404
+    assert client.get("/api/datasets/ghost/files/a.wav/content").status_code == 404
+
+
+def test_file_content_supports_range_requests(client):
+    """<audio> 拖动进度条依赖 Range 分段；Starlette FileResponse 原生支持。"""
+    _make_dataset("alice", files=("a.wav",))
+    full = (paths.DATASETS_DIR / "alice" / "a.wav").read_bytes()
+
+    resp = client.get(
+        "/api/datasets/alice/files/a.wav/content", headers={"range": "bytes=0-9"}
+    )
+
+    assert resp.status_code == 206
+    assert resp.content == full[:10]

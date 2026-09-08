@@ -16,13 +16,16 @@ import threading
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from server import paths
+from server.commands import build_separate_cmd
 # 与 training._check_exp_name 同源的非法字符表（勿在本模块复制一份，改一处必须同源）
 from server.api.training import _EXP_FORBIDDEN
 # 删除互斥的判定依据：任务状态机常量与进程级任务表单例（server.tasks 顶层不加载
 # torch，与 server.main 的导入深度一致，pytest 收集期安全）
-from server.tasks import TERMINAL_STATES, task_manager
+from server.tasks import TERMINAL_STATES, TaskConflictError, task_manager
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,21 @@ META_DIRNAME = ".meta"
 # 流式落盘的 read 粒度：内存占用与拷贝次数的折中（FastAPI 的 UploadFile spool 阈值
 # 也是 1MB，超过即滚到磁盘临时文件，配合本粒度全程只有一块数据在内存里）
 CHUNK_BYTES = 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# 人声分离（tools/vocal_dataset.py，设计见 docs/plans/2026-09-07-dataset-vocal-separation-design.md）
+# ---------------------------------------------------------------------------
+
+# 分离模型 label 白名单：与 tools.pymss_webui.MODEL_SPECS 的 label 逐字同源（勿在本
+# 模块重排或改名，改动须两处同步）。服务进程不得 import 该模块做校验——它顶层构造
+# configs.Config 会加载 torch，违背 server 侧延迟导入纪律，故静态维护；runner 侧
+# tools.pymss_webui.resolve_model 仍会二次校验兜底。顺序即前端下拉顺序。
+SEPARATION_MODELS = ("去混响", "去混响（激进）", "去伴奏", "去伴奏（激进）", "提主旋律")
+# 默认模型与 tools.vocal_dataset.DEFAULT_MODEL 同源（去伴奏：训练集最常见的净化需求）
+DEFAULT_SEPARATION_MODEL = "去伴奏"
+# 衍生数据集固定后缀：分离产物恒为 {name}_vocals（去混响产物也在其中，语义为该
+# 数据集的「净化版」；真实来源与模型记录在衍生标记里）
+DERIVED_SUFFIX = "_vocals"
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +100,50 @@ def _iter_audio(directory: Path) -> tuple[list, list]:
             continue
         (audios if path.suffix.lower() in AUDIO_SUFFIXES else others).append(path)
     return audios, others
+
+
+class SeparateBody(BaseModel):
+    """POST /{name}/separate 请求体。model 为 SEPARATION_MODELS 的 label；
+    files 省略 = 分离整目录，提供 = 只分离这些文件（逐文件分离入口）。"""
+
+    model: str = DEFAULT_SEPARATION_MODEL
+    files: list[str] | None = None
+
+
+# 文件名会以双引号形式进入分离子进程的 shell 命令，这些字符会破坏参数边界或触发
+# 命令替换（_safe_filename 只清洗控制字符，$ 反引号 引号 反斜杠在上传时可能存活）
+_SEPARATE_FILE_FORBIDDEN = '"\\$`'
+
+
+def _derived_marker_path(name: str) -> Path:
+    """衍生标记：.meta/{name}.derived.json（.meta 在各数据集目录之外，与时长侧车同理——
+    放数据集目录内会被 preprocess 当音频再解一次）。"""
+    return paths.DATASETS_DIR / META_DIRNAME / ("%s.derived.json" % name)
+
+
+def _write_derived_marker(name: str, source: str, model: str) -> None:
+    """写衍生标记（建任务时写入）。尽力而为：写失败只影响列表的 derived_from 展示，
+    不影响分离产物本身。"""
+    try:
+        meta_dir = paths.DATASETS_DIR / META_DIRNAME
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        _derived_marker_path(name).write_text(
+            json.dumps({"source": source, "model": model}, ensure_ascii=False),
+            encoding="utf8",
+        )
+    except OSError:
+        logger.debug("衍生标记写入失败：%s", name, exc_info=True)
+
+
+def _read_derived_source(name: str) -> str | None:
+    """衍生标记里的源数据集名；无标记 / 坏 JSON → None（语义同 _cache_load：缓存不可信
+    即视为无标记）。"""
+    try:
+        data = json.loads(_derived_marker_path(name).read_text(encoding="utf8"))
+    except Exception:  # noqa: BLE001 OSError 与 JSONDecodeError 同类处理
+        return None
+    source = data.get("source") if isinstance(data, dict) else None
+    return source if isinstance(source, str) and source else None
 
 
 # ---------------------------------------------------------------------------
@@ -305,10 +367,15 @@ def list_datasets():
     )
     summaries = []
     for entry in entries:
-        with contextlib.suppress(OSError):
+        try:
+            summary, _ = _scan_dataset(entry)
+        except OSError:
             # 并发删除的竞态（扫描到一半目录消失）只影响该数据集，跳过即可，
             # 不让整个列表 500
-            summaries.append(_scan_dataset(entry)[0])
+            continue
+        # 衍生标记在并发删除的窗口里可能已随之消失，读不到按普通数据集展示
+        summary["derived_from"] = _read_derived_source(entry.name)
+        summaries.append(summary)
     return summaries
 
 
@@ -324,6 +391,7 @@ def dataset_detail(name: str):
         # 404 检查之后、扫描过程中被并发删除：如实按不存在处理
         raise HTTPException(404, "数据集不存在：%s" % name)
     summary["files"] = files
+    summary["derived_from"] = _read_derived_source(name)
     return summary
 
 
@@ -468,6 +536,149 @@ def upload_dataset_files(
     }
 
 
+@router.post("/{name}/separate")
+def separate_dataset(name: str, body: SeparateBody):
+    """发起人声分离任务：datasets/{name}/ → 衍生数据集 {name}_vocals/（仅人声 stem，
+    伴奏残余丢弃；模型可选，默认去伴奏）。files 省略分离整目录，提供时只分离这些
+    文件（前端逐文件分离入口；产物落到同一衍生目录，按文件幂等天然衔接后续的全量
+    分离——已分离过的文件自动跳过）。
+
+    与训练共用 task_manager 全局互斥（409）——分离与训练都是重负载任务，Mac 统一
+    内存/显存不允许并发；这也让 delete_dataset 的「任务进行中 409 拒删」自动覆盖
+    分离中的源与衍生数据集。产物按文件幂等（已存在的目标 stem 跳过），任务失败或
+    中断后重新发起即续跑，不需要额外参数。衍生标记在建任务时写入（而非成功终态）：
+    列表的血缘徽章对失败重跑同样有意义，且与目录由 runner 启动即创建的时序一致。
+    """
+    directory = _dataset_dir(name)  # 非法名 → 400
+    if not directory.is_dir():
+        raise HTTPException(404, "数据集不存在：%s" % name)
+    if body.model not in SEPARATION_MODELS:
+        raise HTTPException(
+            400,
+            "未知分离模型：%r（可选：%s）" % (body.model, " / ".join(SEPARATION_MODELS)),
+        )
+    audios, _ = _iter_audio(directory)
+    if not audios:
+        raise HTTPException(400, "数据集没有可分离的音频文件：%s" % name)
+    audio_names = {path.name for path in audios}
+    files: list[str] | None = None
+    if body.files:
+        for filename in body.files:
+            if (
+                not filename
+                or any(ch in _SEPARATE_FILE_FORBIDDEN for ch in filename)
+                or any(ord(ch) < 0x20 for ch in filename)
+            ):
+                raise HTTPException(400, "文件名非法：%r" % filename)
+            if filename not in audio_names:
+                raise HTTPException(400, "数据集中没有该音频文件：%s" % filename)
+        files = list(dict.fromkeys(body.files))  # 去重保序
+    output_name = name + DERIVED_SUFFIX
+    output_dir = paths.DATASETS_DIR / output_name
+    cmd = build_separate_cmd(str(directory), str(output_dir), body.model, files)
+    # 任务日志放 .meta（数据集目录之外，与衍生标记同理）；truncate 默认 True：
+    # 每次发起都是全新日志，与训练各阶段的截断语义一致
+    log_path = paths.DATASETS_DIR / META_DIRNAME / ("%s.separate.log" % name)
+    try:
+        task_id = task_manager.create_task("separate", [cmd], log_path)
+    except TaskConflictError as exc:
+        raise HTTPException(409, str(exc))
+    _write_derived_marker(output_name, name, body.model)
+    return {
+        "task_id": task_id,
+        "output_dataset": output_name,
+        "output_path": str(output_dir),
+    }
+
+
+@router.delete("/{name}/files/{filename}")
+def delete_dataset_file(name: str, filename: str):
+    """删除数据集内的单个音频文件（上传错了/多传了的就地纠错）。
+
+    互斥口径与整目录删除一致：任何训练类任务非终态时 409 拒删——preprocess 正在
+    遍历该目录时不能动里面的文件，宁可误拦（用户可停任务后重试）。删除最后一个
+    文件后目录为空则连目录一起移除（与上传「不留空目录」同一纪律），目录消失时
+    .meta 下的侧车/标记/日志一并清理，不让列表留下 0 文件的空壳。
+    """
+    directory = _dataset_dir(name)  # 非法名 → 400
+    # filename 校验：路由参数本身不含路径分隔符（单段），这里拒点开头与 NUL——
+    # 口径同 _iter_audio（点开头文件不进列表，也就不该能被删）；文件名允许空格与
+    # 中文（_safe_filename 保留它们），不经 shell，因此不套 _EXP_FORBIDDEN
+    if (
+        not filename
+        or filename.startswith(".")
+        or filename in (".", "..")
+        or "\0" in filename
+    ):
+        raise HTTPException(400, "文件名非法：%r" % filename)
+    if not directory.is_dir():
+        raise HTTPException(404, "数据集不存在：%s" % name)
+    active = [
+        task for task in task_manager.list_tasks() if task["state"] not in TERMINAL_STATES
+    ]
+    if active:
+        raise HTTPException(
+            409,
+            "训练任务进行中（%s），不能删除文件；请先停止或等待任务完成"
+            % active[0]["name"],
+        )
+    target = directory / filename
+    if not target.is_file():
+        raise HTTPException(404, "文件不存在：%s" % filename)
+    try:
+        target.unlink()
+    except OSError:
+        logger.exception("数据集文件删除失败：%s", target)
+        raise HTTPException(500, "删除文件失败：%s" % filename)
+
+    # 时长侧车的对应条目一并清（尽力而为；残留条目也不会被读到——扫描按现存文件取缓存）
+    cache = _cache_load(name)
+    if filename in cache:
+        cache.pop(filename)
+        _cache_store(name, cache)
+
+    # 最后一个文件删掉 → 目录空了就移除（iterdir 含点开头杂物，有杂物则留着不动）
+    if not any(directory.iterdir()):
+        removed = False
+        with contextlib.suppress(OSError):
+            directory.rmdir()
+            removed = True
+        if removed:
+            for meta_name in (f"{name}.json", f"{name}.derived.json", f"{name}.separate.log"):
+                with contextlib.suppress(OSError):
+                    (paths.DATASETS_DIR / META_DIRNAME / meta_name).unlink(missing_ok=True)
+
+    return {"deleted": True}
+
+
+@router.get("/{name}/files/{filename}/content")
+def get_dataset_file_content(name: str, filename: str):
+    """音频文件内容（试听播放）。路径校验与单文件删除同口径（拒点开头/NUL，允许
+    空格与中文）；只读操作，不做任务互斥。走 FileResponse 以获得 Range 分段支持
+    （浏览器 <audio> 拖动进度条依赖它）。"""
+    directory = _dataset_dir(name)  # 非法名 → 400
+    if (
+        not filename
+        or filename.startswith(".")
+        or filename in (".", "..")
+        or "\0" in filename
+    ):
+        raise HTTPException(400, "文件名非法：%r" % filename)
+    if not directory.is_dir():
+        raise HTTPException(404, "数据集不存在：%s" % name)
+    target = directory / filename
+    if not target.is_file():
+        raise HTTPException(404, "文件不存在：%s" % filename)
+    media_type = {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".flac": "audio/flac",
+        ".ogg": "audio/ogg",
+        ".m4a": "audio/mp4",
+    }.get(target.suffix.lower(), "application/octet-stream")
+    return FileResponse(target, media_type=media_type)
+
+
 def _rmtree_best_effort(directory: Path, failed_files: list) -> None:
     """尽力删除目录树：逐项失败不中断，残留文件名收进 failed_files。
 
@@ -521,8 +732,14 @@ def delete_dataset(name: str):
             return {"deleted": False, "failed_files": failed_files}
         raise HTTPException(500, "数据集目录无法移除：%s" % name)
 
-    # 侧车一起删（只是缓存，失败静默——残留侧车不会被任何路径读到）
+    # 侧车一起删（只是缓存/标记/任务日志，失败静默——残留文件不会被任何路径读到）；
+    # 衍生标记与分离日志同在 .meta，源数据集删除后一并清掉，不让列表留下指向
+    # 已删除目录的血缘徽章
     with contextlib.suppress(OSError):
         (paths.DATASETS_DIR / META_DIRNAME / f"{name}.json").unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        _derived_marker_path(name).unlink(missing_ok=True)
+    with contextlib.suppress(OSError):
+        (paths.DATASETS_DIR / META_DIRNAME / f"{name}.separate.log").unlink(missing_ok=True)
 
     return {"deleted": True, "failed_files": []}
