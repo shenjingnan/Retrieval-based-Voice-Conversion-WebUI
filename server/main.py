@@ -17,10 +17,13 @@ from server.tasks import task_manager
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    """shutdown 阶段必须终止仍在运行的任务并等工作线程收尾：任务线程是 daemon 线程，
-    不调 dispose 的话服务退出时线程被硬杀，其训练子进程会孤儿化（继续占 GPU/CPU 且
-    无人能终止）。dispose 默认超时 10s，覆盖 kill_process_tree 自身约 6s 的阻塞；
-    放到线程池里执行，避免阻塞事件循环的关闭序列。"""
+    """startup 阶段恢复持久化的排队任务（重启后按原顺序继续跑，见
+    docs/plans/2026-09-09-training-queue-design.md §4.2；被重启打断的「运行中」
+    任务不自动恢复，需手动重新提交）；shutdown 阶段必须终止仍在运行的任务并等工作
+    线程收尾：任务线程是 daemon 线程，不调 dispose 的话服务退出时线程被硬杀，其训练
+    子进程会孤儿化（继续占 GPU/CPU 且无人能终止）。dispose 默认超时 10s，覆盖
+    kill_process_tree 自身约 6s 的阻塞；放到线程池里执行，避免阻塞事件循环的关闭序列。"""
+    training.restore_pending_tasks()
     yield
     import anyio
 

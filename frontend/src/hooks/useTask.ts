@@ -5,19 +5,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { TaskState } from '@/api/client'
+import { parseLossPoints, type LossPoint } from '@/lib/loss'
 
-/** loss 曲线数据点（展示级解析）：disc/gen 画线，epoch/pct/step 供悬浮提示标注
- *  「这是训练的第几轮第几步」 */
-export interface LossPoint {
-  disc: number
-  gen: number
-  /** 该点所属的训练轮次（取 loss 行之前最近的轮次锚点；缺失为 null） */
-  epoch: number | null
-  /** 该轮次内的进度百分比 */
-  pct: number | null
-  /** 全局训练步数（[step, lr] 锚点；缺失为 null） */
-  step: number | null
-}
+export type { LossPoint } from '@/lib/loss'
 
 export interface TaskView {
   /** 任务状态；null 表示尚未收到任何 status 事件（连接中 / 后端不可达） */
@@ -47,6 +37,8 @@ export interface TaskView {
    * 字段名沿用服务端快照的 snake_case（与 cmds 同类的原样透传）
    */
   current_cmd: number | null
+  /** 队列位次（1-based）；仅任务还在排队（pending）时有值，开始运行后为 null */
+  queue_position: number | null
   /** 重新建立订阅（连接丢失后的手动重挂入口：重置重试额度并重建 EventSource） */
   resubscribe: () => void
 }
@@ -70,34 +62,9 @@ const MAX_RETRIES = 5
 const RETRY_DELAY_MS = 2000
 
 /**
- * loss 行锚点（与 server/progress.py 的五项格式同源；这里只取前两项）。
- * `[-+0-9.eE]` 允许科学计数法；残缺片段（如 "1e+"）交给 Number + isFinite 过滤。
+ * loss 行锚点与解析已收敛到 lib/loss.ts（与 server/progress.py 同源；
+ * 历史日志尾部快照共用同一实现）。
  */
-const LOSS_LINE_RE = /loss_disc=([-+0-9.eE]+),\s*loss_gen=([-+0-9.eE]+)/
-
-/**
- * 轮次锚点行（与 server/progress.py 的 EPOCH_PATTERN 同源）：训练脚本按
- * epoch 行 → [step, lr] 行 → loss 行的顺序输出，逐行扫描即可给每个 loss 点
- * 标注它所属的轮次与全局步数。
- */
-const EPOCH_LINE_RE = /(?:训练轮次：|Training epoch: |Epoch: )(\d+) \[(-?\d+(?:\.\d+)?)%\]/
-
-/** [step, lr] 行（与 server/progress.py 的 STEP_PATTERN 同源，行尾锚定） */
-const STEP_LINE_RE = /\[(-?\d+), (-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\]\s*$/
-
-function parseLossPoint(
-  line: string,
-  epoch: number | null,
-  pct: number | null,
-  step: number | null,
-): LossPoint | null {
-  const m = line.match(LOSS_LINE_RE)
-  if (m === null) return null
-  const disc = Number(m[1])
-  const gen = Number(m[2])
-  if (!Number.isFinite(disc) || !Number.isFinite(gen)) return null
-  return { disc, gen, epoch, pct, step }
-}
 
 /** SSE data 是 JSON；畸形事件丢弃而不是让页面崩掉 */
 function parseData<T>(ev: Event): T | null {
@@ -115,6 +82,7 @@ interface StatusEvent {
   error?: string | null
   cmds?: unknown
   current_cmd?: unknown
+  queue_position?: unknown
 }
 
 interface LogEvent {
@@ -141,6 +109,7 @@ const EMPTY_VIEW: TaskViewState = {
   connectionLost: false,
   cmds: [],
   current_cmd: null,
+  queue_position: null,
 }
 
 export function useTask(taskId: string | null): TaskView {
@@ -216,6 +185,8 @@ export function useTask(taskId: string | null): TaskView {
           : prev.cmds,
         current_cmd:
           typeof data.current_cmd === 'number' ? data.current_cmd : prev.current_cmd,
+        queue_position:
+          typeof data.queue_position === 'number' ? data.queue_position : null,
         terminal: TERMINAL_STATES.has(state),
       }))
       if (TERMINAL_STATES.has(state)) {
@@ -224,30 +195,14 @@ export function useTask(taskId: string | null): TaskView {
       }
     })
 
-    // 轮次/步数锚点跨行跟踪（本订阅闭包内）：训练日志按 epoch → [step, lr] → loss
-    // 的顺序成组输出，每个 loss 点标注它前面最近的锚点。重连时 cursor=0 按原序重放，
-    // 锚点自然收敛回正确值
-    let lastEpoch: number | null = null
-    let lastPct: number | null = null
-    let lastStep: number | null = null
-
+    // 轮次/步数锚点跨行跟踪收敛到 parseLossPoints（批次内成组跟踪）；断线重连时
+    // cursor=0 按原序重放，锚点自然收敛回正确值
     es.addEventListener('log', (ev) => {
       const data = parseData<LogEvent>(ev)
       if (data === null || !Array.isArray(data.lines)) return
       const lines = data.lines.filter((line): line is string => typeof line === 'string')
       if (lines.length === 0) return
-      const points: LossPoint[] = []
-      for (const line of lines) {
-        const epochMatch = line.match(EPOCH_LINE_RE)
-        if (epochMatch !== null) {
-          lastEpoch = Number(epochMatch[1])
-          lastPct = Number(epochMatch[2])
-        }
-        const stepMatch = line.match(STEP_LINE_RE)
-        if (stepMatch !== null) lastStep = Number(stepMatch[1])
-        const point = parseLossPoint(line, lastEpoch, lastPct, lastStep)
-        if (point !== null) points.push(point)
-      }
+      const points = parseLossPoints(lines)
       setView((prev) => ({
         ...prev,
         logs: trimTail([...prev.logs, ...lines], MAX_LOG_LINES),

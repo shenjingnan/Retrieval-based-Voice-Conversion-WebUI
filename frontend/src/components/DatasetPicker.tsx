@@ -41,8 +41,6 @@ export interface DatasetPickerProps {
    * 否则用户可能在目录只落了一半文件时就开训，训出来的东西缺数据
    */
   onUploadBusyChange?: (busy: boolean) => void
-  /** 有训练任务进行中：分离入口被后端 409 互斥（UI 先禁用），上传不拦 */
-  trainingRunning: boolean
 }
 
 /** 正被监视的分离任务；sourceName/outputName 在页面重挂恢复时无法还原（任务摘要不带
@@ -75,7 +73,6 @@ export function DatasetPicker({
   onSelect,
   onUploaded,
   onUploadBusyChange,
-  trainingRunning,
 }: DatasetPickerProps) {
   /** null = 首次加载中；[] = 已加载且服务器上还没有数据集 */
   const [datasets, setDatasets] = useState<DatasetSummary[] | null>(null)
@@ -522,17 +519,16 @@ export function DatasetPicker({
                   {item.status === 'done' && (
                     <>
                       {/* 逐文件分离：只分离这一个文件（产物进同一衍生目录，幂等衔接
-                          后续的全部分离）。与训练/其他分离共用全局互斥，进行中禁用 */}
+                          后续的全部分离）。与训练共用串行队列：训练中发起会自动排队，
+                          仅已有分离在途时禁用 */}
                       <Button
                         variant="outline"
                         size="xs"
-                        disabled={separating !== null || trainingRunning}
+                        disabled={separating !== null}
                         title={
                           separating !== null
                             ? '已有分离任务进行中'
-                            : trainingRunning
-                              ? '训练任务进行中，后端拒绝并发任务'
-                              : '分离该文件的人声'
+                            : '分离该文件的人声（训练运行中将自动排队）'
                         }
                         onClick={() => {
                           setSeparateError(null)
@@ -547,15 +543,12 @@ export function DatasetPicker({
                       >
                         分离
                       </Button>
+                      {/* 删除护栏在后端按引用判定：仅本数据集正被非终态任务读取时
+                          409（错误以行内 notice 透出）；无关数据集不受任务影响 */}
                       <Button
                         variant="outline"
                         size="xs"
-                        disabled={trainingRunning}
-                        title={
-                          trainingRunning
-                            ? '训练任务进行中，后端拒绝删除'
-                            : '从服务器删除该文件（不可恢复，可重新上传）'
-                        }
+                        title="从服务器删除该文件（不可恢复，可重新上传）"
                         onClick={() => deleteUploaded(item)}
                       >
                         删除

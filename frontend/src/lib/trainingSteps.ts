@@ -1,35 +1,27 @@
 /**
- * 训练向导的步骤状态机纯函数（无组件、无副作用）：
- * 独立成模块便于直接推演/测试（node --experimental-strip-types 可直接导入），
- * 组件层（pages/Training.tsx）只做消费。
+ * 训练任务的阶段推导纯函数（无组件、无副作用）：独立成模块便于直接推演/测试
+ * （node --experimental-strip-types 可直接导入）。任务中心化改造后（设计
+ * docs/plans/2026-09-09-task-centric-training-ui-design.md），训练页不再有步骤条，
+ * 这里只服务队列项详情的阶段指示与失败定位。
  */
 import type { TaskState } from '@/api/client'
 
 export type StepId = 'preprocess' | 'extract' | 'fit' | 'index'
 
-/**
- * 步骤状态：
- * - idle 待进行 / running 进行中 / success 成功 / failed 失败
- * - skipped 已跳过（任务被用户停止 cancelled，可重试，与失败区分展示）
- */
-export type StepState = 'idle' | 'running' | 'success' | 'failed' | 'skipped'
-
-/** 监视中的任务归属：pipeline 一键任务驱动全部 4 步 */
-export type WatchedStep = StepId | 'pipeline'
-
 export const STEP_IDS: ReadonlyArray<StepId> = ['preprocess', 'extract', 'fit', 'index']
 
-export const INITIAL_STEP_STATES: Record<StepId, StepState> = {
-  preprocess: 'idle',
-  extract: 'idle',
-  fit: 'idle',
-  index: 'idle',
+/** 任务类型 → 展示名（separate 来自数据集页但与训练共用队列，一并列出） */
+export const TASK_NAME_LABELS: Record<string, string> = {
+  preprocess: '处理数据',
+  extract: '特征提取',
+  fit: '训练',
+  index: '建立索引',
+  pipeline: '一键训练',
+  separate: '人声分离',
 }
 
-const FAILED_LIKE: ReadonlySet<StepState> = new Set(['failed', 'skipped'])
-
-/** 后端任务失败信息（server/tasks.py _failure_message）里的步骤序号锚点（1-based） */
-const FAILURE_STEP_RE = /第 (\d+) 步/
+/** 队列项详情的阶段状态（任务中心的阶段指示语义，与旧步骤条的五态不同） */
+export type StageStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
 
 /**
  * 单条子进程命令 → 所属步骤。与 server/commands.py 的命令模板逐项对应：
@@ -38,8 +30,7 @@ const FAILURE_STEP_RE = /第 (\d+) 步/
  * - train/train_index.py → 建立索引
  * - train/train.py → 训练（'train/train_index.py' 不含 'train/train.py' 子串，
  *   但仍按先 index 后 fit 的顺序判断，防将来模板变化踩坑）
- * - `-m server.api.training precheck` → 处理数据（pipeline 的切分产物校验 cmd，
- *   失败时恢复动作是重跑切分）
+ * - `-m server.api.training precheck` → 处理数据（pipeline 的切分产物校验 cmd）
  * - `-m server.api.training fitprep` → 训练（pipeline 的 fit 前置 cmd）
  */
 export function cmdToStep(cmd: string): StepId | null {
@@ -55,9 +46,8 @@ export function cmdToStep(cmd: string): StepId | null {
 
 /**
  * 从任务失败信息解析真实失败步骤：error 的「第 N 步」（1-based cmd 序号，见
- * server/tasks.py 的 _failure_message）映射到 status 事件携带的 cmds 数组再分类。
- * 解析不出（格式变化 / 索引越界 / cmd 无法识别）时返回 fallback（调用方回退到
- * 「第一个非 success」推断）。
+ * server/tasks.py 的 _failure_message）映射到 cmds 数组再分类。解析不出（任务
+ * 未启动任何 cmd / 格式变化 / cmd 无法识别）时返回 fallback。
  */
 export function resolveFailedStep(
   error: string | null,
@@ -65,94 +55,102 @@ export function resolveFailedStep(
   fallback: StepId | null,
 ): StepId | null {
   if (error === null || cmds === undefined) return fallback
-  const m = error.match(FAILURE_STEP_RE)
+  const m = error.match(/第 (\d+) 步/)
   if (m === null) return fallback
   const cmd = cmds[Number(m[1]) - 1]
   if (cmd === undefined) return fallback
   return cmdToStep(cmd) ?? fallback
 }
 
+export interface StageInput {
+  /** 任务元数据里的阶段归属表（pipeline 提交时登记，与 cmds 等长）；单步任务为 null */
+  stages: ReadonlyArray<string> | null
+  cmds: ReadonlyArray<string>
+  /** 当前正在执行的子命令序号（1-based；null = 尚未启动任何 cmd） */
+  currentCmd: number | null
+  state: TaskState | null
+  error: string | null
+}
+
+const FAILURE_STEP_RE = /第 (\d+) 步/
+
 /**
- * 任务终态 → 步骤状态落定。
- *
- * - 分步：该步 success / failed / skipped（cancelled），其余步骤不受影响
- * - 一键（pipeline）：单任务串行多 cmd，任务状态不直接携带阶段信息。
- *   - failedStep 已解析（resolveFailedStep）：串行语义下失败步骤之前的阶段必然已
- *     成功完成——之前的步骤置 success、失败步骤置失败态、其后置 idle，可精确还原
- *     现场（首次一键没有前置 success 记录时尤其重要）
- *   - failedStep 缺省/无效（解析不到）：回退「第一个非 success」推断，保留已成功
- *     步骤、把第一个未成功步骤标失败态、其后置 idle（与真实失败阶段可能有偏差，
- *     但重试入口仍能走通全流程）
+ * 队列项详情的 4 格阶段状态推导：
+ * - 每条 cmd 的阶段归属：stages 表（等长时）优先，缺省回退 cmds.map(cmdToStep)
+ * - running / pending：当前 cmd 之前 → done、当前 → running、之后 → pending
+ * - success 终态：全部 done
+ * - cancelled 终态：失败/停止阶段之后与未启动的部分 → skipped（启动过 → skipped，
+ *   未启动过 → 全部 skipped）
+ * - failed 终态：失败阶段 = error 的「第 N 步」解析，回退到当前（或首个）阶段；
+ *   其前 done、其处 failed、其后 pending
  */
-export function settleSteps(
-  prev: Record<StepId, StepState>,
-  step: WatchedStep,
-  status: TaskState,
-  failedStep?: StepId | null,
-): Record<StepId, StepState> {
-  if (step === 'pipeline') {
-    if (status === 'success') {
-      return { preprocess: 'success', extract: 'success', fit: 'success', index: 'success' }
+export function stageStatuses(input: StageInput): Record<StepId, StageStatus> {
+  const { stages, cmds, currentCmd, state, error } = input
+  const perCmd: Array<StepId | null> =
+    stages !== null && stages.length === cmds.length
+      ? (stages as Array<StepId | null>)
+      : cmds.map((cmd) => cmdToStep(cmd))
+  const effective = perCmd.filter((stage): stage is StepId => stage !== null)
+  const next: Record<StepId, StageStatus> = {
+    preprocess: 'pending',
+    extract: 'pending',
+    fit: 'pending',
+    index: 'pending',
+  }
+  if (effective.length === 0) {
+    // cmd 无法识别（如历史记录缺 cmds）：无法推导，全部保持 pending
+    return next
+  }
+
+  if (state === 'success') {
+    for (const step of effective) next[step] = 'done'
+    return next
+  }
+
+  const stageStart = (stage: StepId) => perCmd.indexOf(stage)
+  if (state === 'failed') {
+    let failedStep: StepId | null = null
+    const m = error === null ? null : error.match(FAILURE_STEP_RE)
+    if (m !== null) {
+      const cmd = cmds[Number(m[1]) - 1]
+      failedStep = cmd === undefined ? null : cmdToStep(cmd)
     }
-    const failedLike: StepState = status === 'cancelled' ? 'skipped' : 'failed'
-    if (failedStep !== undefined && failedStep !== null) {
-      const idx = STEP_IDS.indexOf(failedStep)
-      if (idx >= 0) {
-        const next = { ...prev }
-        for (const [i, s] of STEP_IDS.entries()) {
-          next[s] = i < idx ? 'success' : i === idx ? failedLike : 'idle'
-        }
-        return next
-      }
+    if (failedStep === null) {
+      failedStep =
+        currentCmd !== null
+          ? (perCmd[Math.min(currentCmd, perCmd.length) - 1] ?? null)
+          : (effective[0] ?? null)
     }
-    const next = { ...prev }
-    for (const s of STEP_IDS) {
-      if (next[s] !== 'success') {
-        next[s] = failedLike
-        for (const later of STEP_IDS.slice(STEP_IDS.indexOf(s) + 1)) {
-          next[later] = 'idle'
-        }
-        break
-      }
+    const failedIdx = failedStep !== null ? stageStart(failedStep) : -1
+    for (const stage of effective) {
+      const idx = stageStart(stage)
+      next[stage] = idx < failedIdx ? 'done' : idx === failedIdx ? 'failed' : 'pending'
     }
     return next
   }
-  const state: StepState =
-    status === 'success' ? 'success' : status === 'cancelled' ? 'skipped' : 'failed'
-  return { ...prev, [step]: state }
-}
 
-/**
- * pipeline 运行中按「当前子命令序号」推进步骤状态（数据源：server/tasks.py 快照的
- * current_cmd，SSE 在切换子命令时补发 status 事件）：
- * - 当前 cmd 之前的阶段 → success（串行语义：必然已完成）
- * - 当前 cmd 所属阶段 → running
- * - 尚未到达的阶段 → idle（校正启动时乐观置 running 的多余部分）
- * currentCmd 越界 / cmd 无法识别返回 null（调用方保持现状不动）。
- */
-export function advancePipelineStages(
-  currentCmd: number,
-  cmds: ReadonlyArray<string>,
-): Record<StepId, StepState> | null {
-  const cmd = cmds[currentCmd - 1]
-  if (cmd === undefined) return null
-  const stage = cmdToStep(cmd)
-  if (stage === null) return null
-  const idx = STEP_IDS.indexOf(stage)
-  const next = {} as Record<StepId, StepState>
-  for (const [i, s] of STEP_IDS.entries()) {
-    next[s] = i < idx ? 'success' : i === idx ? 'running' : 'idle'
+  if (state === 'cancelled') {
+    if (currentCmd === null || currentCmd <= 0) {
+      // 未启动过任何 cmd 的取消（排队中取消 / setup 失败前停止）：全部视为已跳过
+      for (const stage of effective) next[stage] = 'skipped'
+      return next
+    }
+    const activeIdx = Math.min(currentCmd, perCmd.length) - 1
+    for (const stage of effective) {
+      const idx = stageStart(stage)
+      next[stage] = idx < activeIdx ? 'done' : idx === activeIdx ? 'skipped' : 'pending'
+    }
+    return next
+  }
+
+  // pending / running：按当前 cmd 推进
+  if (currentCmd === null) {
+    return next
+  }
+  const activeIdx = Math.min(currentCmd, perCmd.length) - 1
+  for (const stage of effective) {
+    const idx = stageStart(stage)
+    next[stage] = idx < activeIdx ? 'done' : idx === activeIdx ? 'running' : 'pending'
   }
   return next
-}
-
-/**
- * 任务失败/停止后的「重试该步」目标：
- * - 分步：失败的那一步
- * - 一键：settleSteps 标记出的第一个失败/停止步骤（精确解析时即真实失败步骤；
- *   其后步骤锁定，重试成功后按前置状态继续解锁）
- * 无可重试步骤（无终态失败）返回 null。
- */
-export function pickRetryStep(states: Record<StepId, StepState>): StepId | null {
-  return STEP_IDS.find((s) => FAILED_LIKE.has(states[s])) ?? null
 }
