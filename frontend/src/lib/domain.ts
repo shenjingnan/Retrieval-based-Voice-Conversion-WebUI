@@ -62,6 +62,11 @@ export function formatDuration(sec: number | null): string {
   return min > 0 ? `${min} 分 ${s} 秒` : `${s} 秒`
 }
 
+/** 字节 → GiB 文本（1 位小数）。单位「GiB」由调用方拼接，null 由调用方先行降级 */
+export function formatGib(bytes: number): string {
+  return (bytes / 1024 ** 3).toFixed(1)
+}
+
 /**
  * 模型名 stem → 实验名（与 server/api/models.py 的 experiment_name 同源，含
  * IGNORECASE）：剥训练产物的 epoch/step 后缀，alice_v2_e20_s100 → alice_v2
