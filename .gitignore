@@ -16,3 +16,13 @@ logs
 datasets/
 .model-downloads/
 .DS_Store
+
+# 本机生成的 Windows 根证书导出(见 export_win_roots.ps1)
+.win_roots.pem
+
+# 运行时二进制
+ffmpeg.exe
+ffprobe.exe
+
+# Python 虚拟环境
+.venv/

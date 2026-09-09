@@ -83,7 +83,9 @@ def main() -> None:
         sys.exit(1)
 
     threading.Timer(1.0, webbrowser.open, args=(f"http://127.0.0.1:{port}",)).start()
-    uvicorn.run(create_app(), host="127.0.0.1", port=port, log_level="info")
+    # 0.0.0.0：与老版 webui（gradio server_name="0.0.0.0"）对齐，允许局域网其他设备访问。
+    # 该服务无任何鉴权，绑定全网卡意味着局域网内任何人都能上传/删除数据集与模型、发起训练
+    uvicorn.run(create_app(), host="0.0.0.0", port=port, log_level="info")
 
 
 if __name__ == "__main__":
