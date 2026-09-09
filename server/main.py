@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from server import paths
-from server.api import datasets, infer, models, training
+from server.api import datasets, infer, models, system, training
 from server.tasks import task_manager
 
 
@@ -33,6 +33,7 @@ def create_app() -> FastAPI:
     app.include_router(datasets.router)
     app.include_router(infer.router)
     app.include_router(training.router)
+    app.include_router(system.router)
 
     @app.get("/api/health")
     def health():

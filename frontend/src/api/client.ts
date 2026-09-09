@@ -122,6 +122,53 @@ export interface DeleteDatasetFileResult {
   deleted: boolean
 }
 
+/** GET /api/system/stats 单块 GPU 快照（server/api/system.py _parse_nvidia_smi 逐字段对齐） */
+export interface GpuStats {
+  /** 设备序号（nvidia-smi index，从 0 起） */
+  index: number
+  /** 产品名，如 "NVIDIA GeForce RTX 4090" */
+  name: string
+  /** 0-100；WDDM 等驱动不支持该计数器时为 null（逐字段降级，非整卡降级） */
+  utilization_percent: number | null
+  memory_used_bytes: number | null
+  memory_total_bytes: number | null
+}
+
+/** CPU 快照；psutil 缺失时整个对象为 null */
+export interface CpuStats {
+  /** 0-100，1 位小数；服务启动后的首个采样帧可能读得偏低（psutil 差分采样） */
+  percent: number
+  /** 逻辑核数 */
+  count: number
+}
+
+/** 内存快照（used = total - available，与任务管理器同口径）；psutil 缺失时为 null */
+export interface MemoryStats {
+  used_bytes: number
+  total_bytes: number
+}
+
+/** 磁盘快照（仓库根目录所在卷，logs/ 与 datasets/ 都在其下）；stat 失败时为 null */
+export interface DiskStats {
+  used_bytes: number
+  free_bytes: number
+  total_bytes: number
+}
+
+/**
+ * GET /api/system/stats：整机资源快照。cpu/memory/disk 为 null 表示该采集项不可用；
+ * gpus 为空数组表示无可用 NVIDIA GPU（无驱动 / nvidia-smi 不在 PATH / 采集失败），
+ * 两者是刻意的不同形降级语义。端点设计上永不 500，前端失败仅需处理网络层。
+ */
+export interface SystemStats {
+  /** 服务端生成时刻（unix 秒） */
+  timestamp: number
+  cpu: CpuStats | null
+  memory: MemoryStats | null
+  disk: DiskStats | null
+  gpus: GpuStats[]
+}
+
 /**
  * 从错误响应提取可读信息。detail 仅在为字符串时使用——
  * FastAPI 422 校验错误的 detail 是对象数组，直接塞给 Error 会得到 "[object Object]"，
@@ -314,4 +361,9 @@ export const api = {
     if (!resp.ok) throw await errorFrom(resp)
     await resp.json().catch(() => null)
   },
+
+  // -- 系统：整机资源快照（server/api/system.py） --------------------------------
+
+  systemStats: (): Promise<SystemStats> =>
+    fetch('/api/system/stats').then((r) => handle<SystemStats>(r)),
 }

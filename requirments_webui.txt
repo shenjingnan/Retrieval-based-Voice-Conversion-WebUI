@@ -14,4 +14,5 @@ python-multipart>=0.0.20  # FastAPI File/UploadFile 解析（此前仅靠 gradio
 soundfile>=0.13.0,<1  # server/api/infer.py 写 wav（import 期硬依赖）
 av>=15.1.0,<16  # server/api/datasets.py 数据集时长探测（延迟导入，失败走 soundfile 兜底）
 httpx>=0.28.1  # fastapi.testclient 依赖
+psutil>=7.0.0  # server/api/system.py 整机内存/CPU 采集（函数内延迟导入，未安装则这两项显示「不可用」）
 pytest>=8.4.2
