@@ -43,7 +43,14 @@ from server.commands import (  # noqa: F401  SampleRate 仅用于类型注解
     resolve_is_half,
 )
 from server.progress import parse_stage_progress_line, parse_train_line
-from server.tasks import SUCCESS, TERMINAL_STATES, TaskConflictError, task_manager
+from server.task_store import TaskHistoryStore
+from server.tasks import (
+    PENDING,
+    RESTORE_FACTORIES,
+    SUCCESS,
+    TERMINAL_STATES,
+    task_manager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -469,15 +476,43 @@ def fitprep_main(argv: list) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _create(name: str, cmds: list, log_path: Path, *, setup=None, meta: dict | None = None):
-    """登记任务并把 TaskConflictError 映射成 409；meta 记入任务元数据表。"""
-    try:
-        task_id = task_manager.create_task(name, cmds, log_path, setup=setup)
-    except TaskConflictError as exc:
-        raise HTTPException(409, str(exc))
+def _ensure_exp_idle(exp_name: str) -> None:
+    """同名实验互斥（队列化后唯一保留的 409，见
+    docs/plans/2026-09-09-training-queue-design.md §2）：非终态任务（运行中或排队中）
+    里已有相同 exp_name 时拒绝——两个任务共写 logs/{exp} 会互相覆盖权重与索引。
+    终态任务不受限（重新提交同一实验是合法的重跑/续训路径）。"""
+    for snapshot in task_manager.list_tasks():
+        if snapshot["state"] in TERMINAL_STATES:
+            continue
+        meta = _TASK_META.get(snapshot["id"]) or {}
+        if meta.get("exp_name") == exp_name:
+            phase = "运行中" if snapshot["state"] == "running" else "排队中"
+            raise HTTPException(
+                409,
+                "实验 %s 已有任务在%s（%s），请等待完成或先停止"
+                % (exp_name, phase, snapshot["name"]),
+            )
+
+
+def _create(name: str, cmds: list, log_path: Path, *, setup=None, meta: dict | None = None,
+            definition: dict | None = None):
+    """登记任务并返回 {task_id, queued, queue_position}。
+
+    已有任务运行中时不再拒绝：任务自动排队（design §4.1），响应里的 queued 与
+    queue_position 供前端展示「排在第几位」。meta 记入任务元数据表（进度换算锚点
+    + 同名互斥 + 队列面板展示）；definition 为可序列化任务定义，随 pending 快照
+    持久化、重启后按 kind 重建（见 restore_pending_tasks）。"""
+    task_id = task_manager.create_task(
+        name, cmds, log_path, setup=setup, definition=definition
+    )
     if meta:
         _TASK_META[task_id] = meta
-    return {"task_id": task_id}
+    snapshot = task_manager.get_task(task_id) or {}
+    return {
+        "task_id": task_id,
+        "queued": snapshot.get("state") == PENDING,
+        "queue_position": snapshot.get("queue_position"),
+    }
 
 
 @router.post("/train/preprocess")
@@ -488,8 +523,15 @@ def start_preprocess(body: PreprocessBody):
     dataset_dir = _check_dataset_dir(body.dataset_dir)
     sr = _check_sr(body.sr)
     n_p = _resolve_n_p(body.n_p)
+    _ensure_exp_idle(exp_name)
     cmd = build_preprocess_cmd(dataset_dir, SR_DICT[sr], n_p, exp_name, NOPARALLEL, PREPROCESS_PER)
-    return _create("preprocess", [cmd], _task_log(exp_name, "preprocess.log"))
+    return _create(
+        "preprocess",
+        [cmd],
+        _task_log(exp_name, "preprocess.log"),
+        meta={"exp_name": exp_name},
+        definition={"kind": "preprocess", "body": body.model_dump()},
+    )
 
 
 @router.post("/train/extract")
@@ -502,11 +544,14 @@ def start_extract(body: ExtractBody):
     if body.if_f0:  # webui 同序：先 f0 后 HuBERT，两段共享同一日志文件
         cmds.append(build_extract_f0_cmd(exp_name, os.cpu_count(), f0_method))
     cmds.append(build_extract_hubert_cmd(exp_name, version, resolve_is_half()))
+    _ensure_exp_idle(exp_name)
     return _create(
         "extract",
         cmds,
         _task_log(exp_name, "extract_f0_feature.log"),
         setup=_preprocess_check_setup(exp_dir),
+        meta={"exp_name": exp_name},
+        definition={"kind": "extract", "body": body.model_dump()},
     )
 
 
@@ -526,12 +571,14 @@ def start_fit(body: FitBody):
     _check_epochs(body)
     batch_size, batch_note = _resolve_batch_size(body.batch_size)
     exp_dir = paths.LOGS_DIR / exp_name
+    _ensure_exp_idle(exp_name)
     return _create(
         "fit",
         [_fit_cmd(body, sr, version, batch_size)],
         _task_log(exp_name, "train_task_fit.log"),
         setup=_fit_setup(exp_dir, sr, version, body.if_f0, batch_note),
-        meta={"total_epoch": body.total_epoch},
+        meta={"total_epoch": body.total_epoch, "exp_name": exp_name},
+        definition={"kind": "fit", "body": body.model_dump(), "batch_note": batch_note},
     )
 
 
@@ -571,8 +618,15 @@ def train_defaults():
 def start_index(body: IndexBody):
     exp_name = _check_exp_name(body.exp_name)
     version = _check_version(body.version)
+    _ensure_exp_idle(exp_name)
     cmd = build_index_cmd(exp_name, version, os.cpu_count())
-    return _create("index", [cmd], _task_log(exp_name, "train_index.log"))
+    return _create(
+        "index",
+        [cmd],
+        _task_log(exp_name, "train_index.log"),
+        meta={"exp_name": exp_name},
+        definition={"kind": "index", "body": body.model_dump()},
+    )
 
 
 @router.post("/train/pipeline")
@@ -611,12 +665,23 @@ def start_pipeline(body: PipelineBody):
     stages.append("fit")
     cmds.append(build_index_cmd(exp_name, version, os.cpu_count()))
     stages.append("index")
+    _ensure_exp_idle(exp_name)
     return _create(
         "pipeline",
         cmds,
         _task_log(exp_name, "pipeline_task.log"),
         setup=_pipeline_notice_setup(batch_note),
-        meta={"total_epoch": body.total_epoch, "pipeline_stages": stages},
+        meta={
+            "total_epoch": body.total_epoch,
+            "pipeline_stages": stages,
+            "exp_name": exp_name,
+        },
+        definition={
+            "kind": "pipeline",
+            "body": body.model_dump(),
+            "batch_note": batch_note,
+            "pipeline_stages": stages,
+        },
     )
 
 
@@ -727,40 +792,56 @@ def _progress_of(snapshot: dict):
 
 
 def _status_payload(snapshot: dict) -> dict:
-    """SSE 的 status 事件体：完整快照去掉 logs——日志由 log 事件承载，避免每条 status
-    重复携带最多 1000 行；progress/current 换算为读时计算值。"""
-    payload = {key: value for key, value in snapshot.items() if key != "logs"}
+    """SSE 的 status 事件体：完整快照去掉 logs 与 definition——日志由 log 事件承载
+    （避免每条 status 重复携带最多 1000 行），definition 是内部持久化字段
+    （params 投影已携带等价信息）；progress/current 换算为读时计算值。"""
+    payload = {
+        key: value
+        for key, value in snapshot.items()
+        if key not in ("logs", "definition")
+    }
     payload.update(_progress_state(snapshot))
     return payload
 
 
 @router.get("/tasks")
 def list_tasks():
-    return [
-        {
-            "id": snapshot["id"],
-            "name": snapshot["name"],
-            "state": snapshot["state"],
-            "progress": _progress_of(snapshot),
-            "error": snapshot["error"],
-        }
-        for snapshot in task_manager.list_tasks()
-    ]
+    """任务列表（前端队列面板数据源）：内存任务 + 磁盘历史合并（按 id 去重，
+    内存优先）。历史行是终态快照投影，不含 logs_tail（展开时经 GET /tasks/{id}
+    一次性拉取），queue_position 恒为 None。"""
+    rows = []
+    memory_ids = set()
+    for snapshot in task_manager.list_tasks():
+        memory_ids.add(snapshot["id"])
+        rows.append(_task_row(snapshot, history=False))
+    for record in _history_rows():
+        if record.get("id") in memory_ids:
+            continue
+        rows.append(_task_row(record, history=True))
+    return rows
 
 
 @router.get("/tasks/{task_id}")
 def get_task(task_id: str):
+    """任务详情。内存任务：完整快照 + 读时进度；否则回退历史记录（含 logs_tail，
+    供前端展开历史队列项时一次性拉取日志与 loss 数据）；都不存在 → 404。"""
     snapshot = task_manager.get_task(task_id)
-    if snapshot is None:
-        raise HTTPException(404, "任务不存在：%s" % task_id)
-    snapshot.update(_progress_state(snapshot))
-    return snapshot
+    if snapshot is not None:
+        snapshot.pop("definition", None)  # 内部字段不外露（params 投影已携带等价信息）
+        snapshot.update(_progress_state(snapshot))
+        snapshot["history"] = False
+        return snapshot
+    for record in _history_rows():
+        if record.get("id") == task_id:
+            return {**record, "queue_position": None, "history": True}
+    raise HTTPException(404, "任务不存在：%s" % task_id)
 
 
 @router.delete("/tasks/{task_id}")
 def cancel_task(task_id: str):
     """触发终止（进程组 SIGTERM→SIGKILL）。已终态时 cancel 是幂等 no-op，仍返回 202
-    并带上当前状态——前端「停止」按钮与任务自然结束竞态时不需要区分。"""
+    并带上当前状态——前端「停止」按钮与任务自然结束竞态时不需要区分。排队中的任务
+    即时出队落 cancelled。"""
     snapshot = task_manager.get_task(task_id)
     if snapshot is None:
         raise HTTPException(404, "任务不存在：%s" % task_id)
@@ -769,6 +850,13 @@ def cancel_task(task_id: str):
         status_code=202,
         content={"id": task_id, "state": (task_manager.get_task(task_id) or snapshot)["state"]},
     )
+
+
+@router.delete("/tasks")
+def clear_tasks():
+    """「停止并清空队列」（design §4.1）：终止当前任务（进程组终止由其工作线程执行）
+    并取消全部排队任务。幂等：空队列时是 no-op。"""
+    return task_manager.clear_queue()
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +953,205 @@ def _task_event_stream(task_id: str, cursor: int):
                 last_sent = time.monotonic()
     finally:
         _active_streams.discard(task_id)
+
+
+# ---------------------------------------------------------------------------
+# 启动恢复（main.py lifespan startup 调用，design docs/plans/2026-09-09-training-
+# queue-design.md §4.2）：把持久化的排队任务按原顺序重新入队
+# ---------------------------------------------------------------------------
+
+
+def _restore_training_task(definition: dict):
+    """按 kind 重建任务记录里不可序列化的部分，返回 (setup, meta)。
+
+    cmds/log_path 等已随记录持久化（提交时定格了 batch_size 自适应、device/is_half、
+    底模存在性探测的结果），因此重建是纯 Python 文件系统操作，不触发 torch 加载。
+    setup 闭包在任务真正开始执行时才跑，校验的是执行时刻的产物状态。"""
+    kind = definition.get("kind")
+    body = definition.get("body") or {}
+    exp_name = body.get("exp_name")
+    if kind == "preprocess":
+        return None, {"exp_name": exp_name}
+    if kind == "extract":
+        return _preprocess_check_setup(paths.LOGS_DIR / exp_name), {"exp_name": exp_name}
+    if kind == "fit":
+        return (
+            _fit_setup(
+                paths.LOGS_DIR / exp_name,
+                body["sr"],
+                body["version"],
+                body["if_f0"],
+                definition.get("batch_note"),
+            ),
+            {"total_epoch": body["total_epoch"], "exp_name": exp_name},
+        )
+    if kind == "index":
+        return None, {"exp_name": exp_name}
+    if kind == "pipeline":
+        return (
+            _pipeline_notice_setup(definition.get("batch_note")),
+            {
+                "total_epoch": body["total_epoch"],
+                "exp_name": exp_name,
+                "pipeline_stages": definition["pipeline_stages"],
+            },
+        )
+    return None
+
+
+for _kind in ("preprocess", "extract", "fit", "index", "pipeline"):
+    RESTORE_FACTORIES[_kind] = _restore_training_task
+
+
+def restore_pending_tasks() -> dict:
+    """读取持久化的排队任务并按文件顺序重新入队（保留原 id 与提交时间），返回
+    {"restored", "skipped"}。首条任务在空闲服务上即刻启动；已有任务运行中则全部
+    排队。缺字段 / kind 未注册的记录跳过并告警（恢复完成后由入队路径把文件收敛
+    为恢复后的快照，坏记录自然剔除）。queue_store 为 None（测试隔离）时是 no-op。"""
+    store = task_manager.queue_store
+    if store is None:
+        return {"restored": 0, "skipped": 0}
+    records = store.load()
+    restored = 0
+    skipped = 0
+    for record in records:
+        definition = record.get("definition") or {}
+        if not isinstance(definition, dict) or definition.get("kind") not in RESTORE_FACTORIES:
+            logger.warning("恢复队列：未知任务定义，跳过记录 %s", record.get("id"))
+            skipped += 1
+            continue
+        try:
+            setup, meta = RESTORE_FACTORIES[definition["kind"]](definition)
+            task_manager.create_task(
+                record["name"],
+                record["cmds"],
+                Path(record["log_path"]),
+                truncate=bool(record.get("truncate", True)),
+                setup=setup,
+                definition=definition,
+                task_id=record["id"],
+                created_at=float(record["created_at"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("恢复队列：跳过损坏记录 %s：%s", record.get("id"), exc)
+            skipped += 1
+            continue
+        if meta:
+            _TASK_META[record["id"]] = meta
+        restored += 1
+    if records:
+        logger.info("队列恢复完成：%d 个排队任务已恢复，%d 条记录跳过", restored, skipped)
+    return {"restored": restored, "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# 训练历史（design docs/plans/2026-09-09-task-centric-training-ui-design.md §3）：
+# 任务落终态时记录快照落盘，跨重启可回看（loss 尾部趋势 / 日志 / 参数）。
+# 磁盘上的任务日志不完整（pipeline 多 cmd 共用文件且逐 cmd 截断），内存环形缓冲
+# 是唯一完整来源，因此历史必须在终态时随快照落盘。
+# ---------------------------------------------------------------------------
+
+#: 日志尾部快照行数：≈15-30 epoch 的 loss 尾部趋势 + 失败原因，单条记录 ~36KB
+HISTORY_LOG_TAIL_LINES = 300
+#: 历史记录上限（新进旧出）
+HISTORY_CAP = 50
+
+# 模块级历史状态。store 走惰性解析（路径随 paths.ROOT 的测试 monkeypatch 跟随，
+# 不得在 import 时固化）；cache 是磁盘内容的内存镜像（GET /api/tasks 3s 轮询直接
+# 读它，避免反复解析大 JSON）；recorded_ids 保证同一任务只记一次。
+_history_store: TaskHistoryStore | None = None
+_history_cache: list | None = None
+_recorded_ids: set = set()
+
+
+def _get_history_store() -> TaskHistoryStore:
+    global _history_store
+    if _history_store is None:
+        _history_store = TaskHistoryStore(paths.history_file(), cap=HISTORY_CAP)
+    return _history_store
+
+
+def _history_rows() -> list:
+    """历史记录（旧→新序），首次访问从磁盘惰性加载。"""
+    global _history_cache
+    if _history_cache is None:
+        try:
+            _history_cache = _get_history_store().load()
+        except OSError:
+            logger.exception("训练历史读取失败，按空历史处理")
+            _history_cache = []
+    return _history_cache
+
+
+def _record_history(snapshot: dict) -> None:
+    """on_finish 回调（server/tasks.py）：把终态任务写入历史。
+    非终态快照、重复投递、无训练元数据的任务（separate 等）一律跳过；
+    写盘失败降级为日志（历史故障不得影响任务与队列）。"""
+    global _history_cache
+    if snapshot.get("state") not in TERMINAL_STATES:
+        return
+    task_id = snapshot.get("id")
+    if not task_id or task_id in _recorded_ids:
+        return
+    meta = _TASK_META.get(task_id)
+    if not meta:  # separate 等无训练语义的任务
+        return
+    definition = snapshot.get("definition") or {}
+    record = {
+        "id": task_id,
+        "name": snapshot.get("name"),
+        "kind": definition.get("kind"),
+        "exp_name": meta.get("exp_name"),
+        "state": snapshot.get("state"),
+        "error": snapshot.get("error"),
+        "created_at": snapshot.get("created_at"),
+        "started_at": snapshot.get("started_at"),
+        "finished_at": snapshot.get("finished_at"),
+        "current_cmd": snapshot.get("current_cmd"),
+        "progress": _progress_state(snapshot)["progress"],
+        "cmds": snapshot.get("cmds") or [],
+        "params": definition.get("body") or {},
+        "pipeline_stages": meta.get("pipeline_stages"),
+        "log_path": snapshot.get("log_path"),
+        "logs_tail": list(snapshot.get("logs") or [])[-HISTORY_LOG_TAIL_LINES:],
+    }
+    try:
+        _get_history_store().record(record)
+    except OSError:
+        logger.exception("训练历史写入失败（不影响任务）：%s", task_id)
+        return
+    _recorded_ids.add(task_id)
+    if _history_cache is None:
+        _history_cache = _get_history_store().load()  # 含本条，且已按 cap 截断
+    else:
+        _history_cache = [row for row in _history_cache if row.get("id") != task_id]
+        _history_cache.append(record)
+        if len(_history_cache) > HISTORY_CAP:
+            _history_cache = _history_cache[len(_history_cache) - HISTORY_CAP:]
+
+
+task_manager.on_finish = _record_history  # 进程级单例挂记录器（测试实例各自接线）
+
+
+def _task_row(snapshot: dict, *, history: bool) -> dict:
+    """GET /api/tasks 的行投影（内存与历史两类行字段形状完全一致，前端一套渲染）。"""
+    meta = _TASK_META.get(snapshot.get("id")) or {}
+    definition = snapshot.get("definition") or {}
+    return {
+        "id": snapshot.get("id"),
+        "name": snapshot.get("name"),
+        "state": snapshot.get("state"),
+        "progress": _progress_state(snapshot)["progress"] if not history else snapshot.get("progress"),
+        "error": snapshot.get("error"),
+        "queue_position": snapshot.get("queue_position"),
+        "exp_name": meta.get("exp_name") or snapshot.get("exp_name"),
+        "kind": definition.get("kind") or snapshot.get("kind"),
+        "params": definition.get("body") or snapshot.get("params") or {},
+        "pipeline_stages": meta.get("pipeline_stages") or snapshot.get("pipeline_stages"),
+        "created_at": snapshot.get("created_at"),
+        "finished_at": snapshot.get("finished_at"),
+        "history": history,
+    }
 
 
 if __name__ == "__main__":  # pipeline 的 fit 前置子进程（见 build_fitprep_cmd）

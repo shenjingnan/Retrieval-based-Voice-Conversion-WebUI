@@ -7,13 +7,42 @@ export interface RvcModel {
 /** server/tasks.py 的状态机（pending → running → success | failed | cancelled） */
 export type TaskState = 'pending' | 'running' | 'success' | 'failed' | 'cancelled'
 
-/** GET /api/tasks 的紧凑投影 */
+/**
+ * GET /api/tasks 的行投影（内存任务与磁盘历史两类行字段形状一致，history 区分）。
+ * 历史行是终态快照投影：queue_position 恒为 null、progress 为记录时值。
+ */
 export interface TaskSummary {
   id: string
   name: string
   state: TaskState
   progress: number | null
   error: string | null
+  /** 1-based 队列位次；仅排队（pending）任务有值，运行中/终态为 null */
+  queue_position: number | null
+  /** 训练任务的实验名（任务元数据登记）；separate 等无实验语义的任务为 null */
+  exp_name: string | null
+  /** 任务类型（preprocess/extract/fit/index/pipeline/separate） */
+  kind: string | null
+  /** 提交时的请求体（重新提交 = 同名实验断点续训） */
+  params: Record<string, unknown> | null
+  /** pipeline 的阶段归属表（与 cmds 等长）；单步任务为 null */
+  pipeline_stages: string[] | null
+  created_at: number | null
+  finished_at: number | null
+  /** true = 来自磁盘历史（服务重启前完成的任务） */
+  history: boolean
+}
+
+/** GET /api/tasks/{id} 对历史任务的详情（内存任务走 SSE，不需要它） */
+export interface TaskHistoryDetail extends Omit<TaskSummary, 'history'> {
+  history: true
+  /** 任务结束时的日志尾部快照（磁盘任务日志逐 cmd 截断，以此为准） */
+  logs_tail: string[]
+  /** 命令串（解析失败阶段用） */
+  cmds: string[]
+  current_cmd: number | null
+  started_at: number | null
+  log_path: string | null
 }
 
 export type SampleRate = '48k' | '40k' | '32k'
@@ -45,9 +74,20 @@ export interface TrainParams {
   save_every_weights: boolean
 }
 
-/** 训练接口的统一返回体：{task_id} */
+/** 训练接口的统一返回体。已有任务运行中时新任务自动排队：queued=true 且
+ *  queue_position 给出当前位次（立即可跑时为 false/null） */
 export interface TaskCreated {
   task_id: string
+  queued: boolean
+  queue_position: number | null
+}
+
+/** DELETE /api/tasks（停止并清空队列）的返回体 */
+export interface ClearQueueResult {
+  /** 被停止的运行中任务 id（无则为 null） */
+  stopped_task: string | null
+  /** 被取消的排队任务数 */
+  cancelled_pending: number
 }
 
 /** DELETE /api/models/{name} 的返回体：联动删除的索引文件名列表见 server/api/models.py */
@@ -105,11 +145,14 @@ export interface DeleteDatasetResult {
 }
 
 /**
- * POST /api/datasets/{name}/separate 的返回体：分离任务已创建（与训练共用全局互斥，
- * 冲突为 409）。output_dataset 恒为 {name}_vocals，前端在任务成功后按名刷新并选中它。
+ * POST /api/datasets/{name}/separate 的返回体：分离任务已创建（与训练共用串行队列，
+ * 训练任务运行中时自动排队）。output_dataset 恒为 {name}_vocals，前端在任务成功后
+ * 按名刷新并选中它。
  */
 export interface SeparateDatasetResult {
   task_id: string
+  queued: boolean
+  queue_position: number | null
   output_dataset: string
   output_path: string
 }
@@ -353,13 +396,25 @@ export const api = {
   getTasks: (): Promise<TaskSummary[]> =>
     fetch('/api/tasks').then((r) => handle<TaskSummary[]>(r)),
 
-  /** 终止任务。后端已终态时返回幂等 no-op 的 202，2xx（resp.ok）一并视为成功 */
+  /** 任务详情：内存任务返回实时快照，历史任务返回含 logs_tail 的记录（展开时拉一次） */
+  taskDetail: (taskId: string): Promise<TaskHistoryDetail> =>
+    fetch(`/api/tasks/${encodeURIComponent(taskId)}`).then((r) => handle<TaskHistoryDetail>(r)),
+
+  /** 终止任务（运行中 → 进程组终止；排队中 → 即时出队取消）。
+   *  后端已终态时返回幂等 no-op 的 202，2xx（resp.ok）一并视为成功 */
   cancelTask: async (taskId: string): Promise<void> => {
     const resp = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
       method: 'DELETE',
     })
     if (!resp.ok) throw await errorFrom(resp)
     await resp.json().catch(() => null)
+  },
+
+  /** 停止并清空队列：终止当前任务 + 取消全部排队任务（幂等，空队列是 no-op） */
+  clearQueue: async (): Promise<ClearQueueResult> => {
+    const resp = await fetch('/api/tasks', { method: 'DELETE' })
+    if (!resp.ok) throw await errorFrom(resp)
+    return resp.json() as Promise<ClearQueueResult>
   },
 
   // -- 系统：整机资源快照（server/api/system.py） --------------------------------

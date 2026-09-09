@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 from server import commands, paths
 from server.api import training
 from server.main import create_app
-from server.tasks import TaskConflictError, TaskManager
+from server.tasks import TERMINAL_STATES, TaskManager
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
@@ -33,46 +33,68 @@ CPU = os.cpu_count()
 
 
 class StubTaskManager:
-    """记录 create_task 入参的替身；快照由测试直接塞进 snapshots。"""
+    """记录 create_task 入参的替身；快照由测试直接塞进 snapshots。
+
+    内置最小队列语义：已有非终态任务时新任务登记为 pending（queue_position 在
+    pending 中顺延），否则即刻 running——API 层 queued/queue_position 的响应映射
+    与同名实验互斥用它验证。list_tasks 按 snapshots 的插入序输出，测试手工播种
+    快照时无需再同步单独的顺序表。
+    """
 
     def __init__(self):
         self.created = []  # create_task 入参（按创建序）
-        self.order = []  # task_id 创建序
+        self.order = []  # task_id 创建序（与 snapshots 插入序一致，保留供断言）
         self.snapshots = {}
         self.cancelled = []
-        self.conflict = None  # 置为异常实例 → create_task 抛出（模拟互斥）
+        self.cleared = 0  # clear_queue 调用次数
 
-    def create_task(self, name, cmds, log_path, truncate: bool = True, *, setup=None):
-        if self.conflict is not None:
-            raise self.conflict
+    def create_task(
+        self, name, cmds, log_path, truncate: bool = True, *, setup=None,
+        definition=None, task_id=None, created_at=None,
+    ):
         self._seq = getattr(self, "_seq", 0) + 1
-        task_id = "task-%d" % self._seq
+        tid = task_id or "task-%d" % self._seq
+        states = [snapshot["state"] for snapshot in self.snapshots.values()]
+        if any(state not in TERMINAL_STATES for state in states):
+            position = states.count("pending") + 1
+            self.snapshots[tid] = _snapshot(
+                tid, name, state="pending", queue_position=position
+            )
+        else:
+            self.snapshots[tid] = _snapshot(tid, name)
         self.created.append(
             {
-                "id": task_id,
+                "id": tid,
                 "name": name,
                 "cmds": list(cmds),
                 "log_path": log_path,
                 "truncate": truncate,
                 "setup": setup,
+                "definition": definition,
             }
         )
-        self.order.append(task_id)
-        self.snapshots[task_id] = _snapshot(task_id, name)
-        return task_id
+        self.order.append(tid)
+        return tid
 
     def get_task(self, task_id):
         return self.snapshots.get(task_id)
 
     def list_tasks(self):
-        return [self.snapshots[task_id] for task_id in self.order]
+        return list(self.snapshots.values())
 
     def cancel(self, task_id):
         self.cancelled.append(task_id)
         return True
 
+    def clear_queue(self):
+        self.cleared += 1
+        return {"stopped_task": None, "cancelled_pending": 0}
 
-def _snapshot(task_id, name="fit", state="running", progress=None, error=None, logs=(), current_cmd=None):
+
+def _snapshot(
+    task_id, name="fit", state="running", progress=None, error=None, logs=(),
+    current_cmd=None, queue_position=None,
+):
     return {
         "id": task_id,
         "name": name,
@@ -81,6 +103,7 @@ def _snapshot(task_id, name="fit", state="running", progress=None, error=None, l
         "error": error,
         "cmds": ["cmd"],
         "current_cmd": current_cmd,
+        "queue_position": queue_position,
         "log_path": "log-path",
         "created_at": 1.0,
         "started_at": 2.0,
@@ -161,7 +184,9 @@ def test_preprocess_builds_command(stub, client, tmp_path):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"task_id": "task-1"}
+    body = resp.json()
+    assert body["task_id"] == "task-1"
+    assert body["queued"] is False and body["queue_position"] is None
     call = stub.created[0]
     assert call["name"] == "preprocess"
     # 请求未带 sr → 钉住默认值 40k（对齐 webui 默认与官方底模推荐）
@@ -294,6 +319,7 @@ def test_pipeline_builds_all_steps_in_one_task(stub, client, monkeypatch, tmp_pa
     # 前端进度条需要 total_epoch；加权进度需要 stages 表（与 cmds 等长）
     assert training._TASK_META["task-1"] == {
         "total_epoch": 20,
+        "exp_name": "mi-test",
         "pipeline_stages": ["preprocess", "preprocess", "extract", "extract", "fit", "fit", "index"],
     }
 
@@ -757,35 +783,143 @@ def test_fitprep_module_resolvable_via_dash_m():
 
 
 # ---------------------------------------------------------------------------
-# 5. 任务查询 / 取消 / 互斥
+# 5. 任务查询 / 取消 / 队列
 # ---------------------------------------------------------------------------
 
 
-def test_conflict_maps_to_409(stub, client):
-    stub.conflict = TaskConflictError("已有训练任务在运行")
+def test_submit_while_active_returns_queued_with_position(stub, client):
+    stub.snapshots["existing"] = _snapshot("existing", name="pipeline")
+    training._TASK_META["existing"] = {"exp_name": "other-exp"}
+
+    resp = client.post("/api/train/fit", json=FIT_BODY)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["task_id"] == "task-1"
+    assert body["queued"] is True
+    assert body["queue_position"] == 1
+
+
+def test_submit_when_idle_returns_not_queued(stub, client):
+    resp = client.post("/api/train/fit", json=FIT_BODY)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["queued"] is False
+    assert body["queue_position"] is None
+
+
+def test_same_exp_conflict_returns_409(stub, client):
+    """同名实验（运行中）拒绝提交：防共写 logs/{exp}，是唯一保留的 409。"""
+    stub.snapshots["existing"] = _snapshot("existing", name="pipeline")
+    training._TASK_META["existing"] = {"exp_name": "mi-test"}
 
     resp = client.post("/api/train/fit", json=FIT_BODY)
 
     assert resp.status_code == 409
-    assert "已有训练任务在运行" in resp.json()["detail"]
+    assert "mi-test" in resp.json()["detail"]
+    assert stub.created == []  # 冲突在登记之前拒绝
 
 
-def test_conflict_with_real_manager_maps_to_409(client, monkeypatch, tmp_path):
-    """真 TaskManager 的互斥也走 409（Stub 只验证映射，这里验证触发路径）。"""
+def test_same_exp_conflict_covers_pending_tasks(stub, client):
+    stub.snapshots["existing"] = _snapshot(
+        "existing", name="fit", state="pending", queue_position=1
+    )
+    training._TASK_META["existing"] = {"exp_name": "mi-test"}
+
+    assert client.post("/api/train/fit", json=FIT_BODY).status_code == 409
+
+
+def test_terminal_same_exp_does_not_conflict(stub, client):
+    stub.snapshots["existing"] = _snapshot(
+        "existing", name="fit", state="failed", error="x"
+    )
+    training._TASK_META["existing"] = {"exp_name": "mi-test"}
+
+    assert client.post("/api/train/fit", json=FIT_BODY).status_code == 200
+
+
+def test_same_exp_conflict_applies_to_all_training_endpoints(stub, client, tmp_path):
+    """同名互斥覆盖 4 步与一键；数据集目录只对 preprocess/pipeline 校验。"""
+    dataset = tmp_path / "ds"
+    dataset.mkdir()
+    stub.snapshots["existing"] = _snapshot("existing", name="fit", state="pending")
+    training._TASK_META["existing"] = {"exp_name": "mi-test"}
+
+    assert client.post("/api/train/preprocess", json={
+        "exp_name": "mi-test", "dataset_dir": str(dataset)
+    }).status_code == 409
+    assert client.post("/api/train/extract", json={"exp_name": "mi-test"}).status_code == 409
+    assert client.post("/api/train/index", json={"exp_name": "mi-test"}).status_code == 409
+    assert client.post("/api/train/pipeline", json={
+        **FIT_BODY, "dataset_dir": str(dataset)
+    }).status_code == 409
+
+
+def test_real_manager_second_submission_queues_and_same_exp_conflicts(
+    client, monkeypatch, tmp_path
+):
+    """真 TaskManager 触发路径：运行中提交不同实验 → 200 排队；同名（运行中或
+    排队中）→ 409。产物目录造齐让 setup 快速通过、任务保持 running。"""
+    _fabricate_features(paths.LOGS_DIR / "mi-test")
+    _fabricate_features(paths.LOGS_DIR / "second-exp")
     manager = TaskManager(
         poll_interval=0.01, popen=lambda cmd, **k: _FakeProcess(0, delay=10**6)
     )
     monkeypatch.setattr(training, "task_manager", manager)
     monkeypatch.setattr(training, "_TASK_META", {})
     try:
-        first = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
-        wait_until(lambda: manager.get_task(first)["state"] == "running")
+        first = client.post("/api/train/fit", json=FIT_BODY)
+        assert first.status_code == 200
+        wait_until(
+            lambda: manager.get_task(first.json()["task_id"])["state"] == "running"
+        )
 
-        resp = client.post("/api/train/fit", json=FIT_BODY)
+        other = dict(FIT_BODY, exp_name="second-exp")
+        resp = client.post("/api/train/fit", json=other)
+        assert resp.status_code == 200
+        assert resp.json()["queued"] is True
+        queued_id = resp.json()["task_id"]
+        wait_until(lambda: manager.get_task(queued_id)["state"] == "pending")
 
-        assert resp.status_code == 409
+        assert client.post("/api/train/fit", json=other).status_code == 409  # 与排队同名
+        assert client.post("/api/train/fit", json=FIT_BODY).status_code == 409  # 与运行中同名
     finally:
         manager.dispose()
+
+
+def test_delete_tasks_clears_queue(stub, client):
+    resp = client.delete("/api/tasks")
+
+    assert resp.status_code == 200
+    assert stub.cleared == 1
+    assert resp.json() == {"stopped_task": None, "cancelled_pending": 0}
+
+
+def test_create_records_definition_and_exp_meta(stub, client):
+    resp = client.post("/api/train/fit", json=FIT_BODY)
+    task_id = resp.json()["task_id"]
+
+    created = stub.created[-1]
+    assert created["definition"]["kind"] == "fit"
+    assert created["definition"]["body"]["exp_name"] == "mi-test"
+    assert created["definition"]["body"]["batch_size"] == 8
+    assert training._TASK_META[task_id]["exp_name"] == "mi-test"
+
+
+def test_pipeline_definition_carries_stages(stub, client, tmp_path):
+    dataset = tmp_path / "ds"
+    dataset.mkdir()
+
+    resp = client.post(
+        "/api/train/pipeline",
+        json={**FIT_BODY, "dataset_dir": str(dataset), "batch_size": None},
+    )
+
+    created = stub.created[-1]
+    assert created["definition"]["kind"] == "pipeline"
+    assert created["definition"]["body"]["exp_name"] == "mi-test"
+    assert created["definition"]["pipeline_stages"] == PIPELINE_STAGES
 
 
 def test_get_task_returns_snapshot_with_computed_progress(stub, client):
@@ -900,25 +1034,25 @@ def test_list_tasks_projects_compact_fields(stub, client):
     stub.snapshots = {
         "a": _snapshot("a", name="preprocess", progress=None),
         "b": _snapshot("b", name="fit", state="failed", error="boom", logs=["x"]),
+        "c": _snapshot("c", name="pipeline", state="pending", queue_position=2),
     }
-    stub.order = ["a", "b"]
-    training._TASK_META["b"] = {"total_epoch": 10}
+    training._TASK_META["b"] = {"total_epoch": 10, "exp_name": "second"}
     stub.snapshots["b"]["logs"] = ["INFO:mi-test:训练轮次：5 [40%]"]
 
     resp = client.get("/api/tasks")
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body == [
-        {"id": "a", "name": "preprocess", "state": "running", "progress": None, "error": None},
-        {
-            "id": "b",
-            "name": "fit",
-            "state": "failed",
-            "progress": pytest.approx(((5 - 1) + 0.4) / 10),
-            "error": "boom",
-        },
+    assert [(row["id"], row["state"], row["queue_position"], row["exp_name"], row["history"]) for row in body] == [
+        ("a", "running", None, None, False),
+        ("b", "failed", None, "second", False),
+        ("c", "pending", 2, None, False),
     ]
+    # 进度仍按读时解析计算
+    assert body[1]["progress"] == pytest.approx(((5 - 1) + 0.4) / 10)
+    # 内存行的扩展投影：params/kind/pipeline_stages 来自 definition 与元数据
+    assert body[1]["kind"] is None and body[1]["params"] == {}
+    assert body[1]["created_at"] == 1.0 and body[1]["finished_at"] is None
 
 
 def test_delete_task_returns_202_and_cancels(stub, client):

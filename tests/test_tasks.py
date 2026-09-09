@@ -1,4 +1,4 @@
-"""训练任务系统测试：互斥 / 终止 / 日志环形缓冲（默认不真跑训练子进程）。
+"""训练任务系统测试：队列串行 / 终止 / 日志环形缓冲（默认不真跑训练子进程）。
 
 Popen 用构造注入的替身（FakeProcess）替换，日志文件由测试自己写入，任务系统只负责
 「起进程 → 轮询 → 增量读日志 → 判定终态」的编排逻辑。kill_process_tree 在测试里一律
@@ -18,7 +18,6 @@ import pytest
 from server import paths, tasks
 from server.tasks import (
     TERMINAL_STATES,
-    TaskConflictError,
     TaskManager,
 )
 
@@ -100,6 +99,16 @@ def factory(monkeypatch):
     yield _factory
     if "manager" in created:
         created["manager"].dispose()
+
+
+class FakeStore:
+    """queue_store 替身：记录每次 save 的 pending 快照（最近一份在 saved[-1]）。"""
+
+    def __init__(self):
+        self.saved = []
+
+    def save(self, records):
+        self.saved.append(list(records))
 
 
 # ---------------------------------------------------------------------------
@@ -278,39 +287,34 @@ def test_setup_returning_none_writes_nothing(factory, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 2. 全局互斥
+# 2. 任务队列（互斥语义 = 排队等待，而非提交时拒绝）
 # ---------------------------------------------------------------------------
 
 
-def test_global_mutex_blocks_second_task_until_terminal(factory, tmp_path):
-    manager, calls, _ = factory([FakeProcess(0, delay=10**6)])
+def test_second_task_queues_until_first_finishes(factory, tmp_path):
+    manager, calls, _ = factory([FakeProcess(0, delay=10**6), FakeProcess(0)])
     first = manager.create_task("preprocess", ["cmd-1"], tmp_path / "a.log")
     wait_until(lambda: len(calls) == 1)  # 第一个进程已启动
 
-    with pytest.raises(TaskConflictError):
-        manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    assert manager.get_task(second)["state"] == "pending"  # 排队等待，不启动
+    assert len(calls) == 1
 
     calls[0]["proc"].finish()
     wait_until(lambda: manager.get_task(first)["state"] == "success")
-
-    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")  # 终态后互斥释放
-    wait_until(lambda: manager.get_task(second)["state"] == "success")
+    wait_until(lambda: manager.get_task(second)["state"] == "success")  # 自动接续
     assert [call["cmd"] for call in calls] == ["cmd-1", "cmd-2"]
 
 
-def test_concurrent_create_only_one_wins(factory, tmp_path):
-    """互斥标志在并发 create 下必须只放行一个任务。"""
-    manager, calls, _ = factory([FakeProcess(0, delay=10**6)])
-    started, conflicts, lock = [], [], threading.Lock()
+def test_concurrent_creates_all_queue_and_run_serially(factory, tmp_path):
+    """并发 create 不再互斥拒绝：全部入队，同一时刻至多一个 running，按序串行执行。"""
+    manager, calls, _ = factory([FakeProcess(0, delay=10**6) for _ in range(8)])
+    ids, lock = [], threading.Lock()
 
     def worker(index):
-        try:
-            task_id = manager.create_task("t%d" % index, ["cmd"], tmp_path / "a.log")
-            with lock:
-                started.append(task_id)
-        except TaskConflictError:
-            with lock:
-                conflicts.append(index)
+        task_id = manager.create_task("t%d" % index, ["cmd"], tmp_path / "a.log")
+        with lock:
+            ids.append(task_id)
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
     for thread in threads:
@@ -318,11 +322,211 @@ def test_concurrent_create_only_one_wins(factory, tmp_path):
     for thread in threads:
         thread.join(5)
 
-    assert len(started) == 1
-    assert len(conflicts) == 7
-    assert len(manager.list_tasks()) == 1
+    assert len(ids) == 8
+    states = [snapshot["state"] for snapshot in manager.list_tasks()]
+    assert states.count("running") == 1
+    assert states.count("pending") == 7
+
+    for index in range(8):  # 逐个放行：只有队头推进，其余保持串行
+        wait_until(lambda: len(calls) >= index + 1)
+        calls[index]["proc"].finish()
+    wait_until(lambda: all(s["state"] == "success" for s in manager.list_tasks()))
+    assert len(calls) == 8
+
+
+def test_queue_position_reflected_in_snapshot(factory, tmp_path):
+    """pending 任务快照带 1-based 队列位次；running/终态为 None；队头移除后位次前移。"""
+    manager, _, _ = factory(
+        [FakeProcess(0, delay=10**6), FakeProcess(0), FakeProcess(0)]
+    )
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    third = manager.create_task("index", ["cmd-3"], tmp_path / "c.log")
+
+    wait_until(lambda: manager.get_task(first)["state"] == "running")
+    assert manager.get_task(first)["queue_position"] is None
+    assert manager.get_task(second)["queue_position"] == 1
+    assert manager.get_task(third)["queue_position"] == 2
+
+    assert manager.cancel(second) is True
+    wait_until(lambda: manager.get_task(second)["state"] == "cancelled")
+    assert manager.get_task(third)["queue_position"] == 1
+
+
+def test_failed_task_still_starts_next(factory, tmp_path):
+    """失败不拖累队列：失败终态同样触发调度，下一个任务自动开始。"""
+    manager, calls, _ = factory([FakeProcess(returncode=3, delay=2), FakeProcess(0)])
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+
+    wait_until(lambda: manager.get_task(first)["state"] == "failed")
+    wait_until(lambda: manager.get_task(second)["state"] == "success")
+    assert [call["cmd"] for call in calls] == ["cmd-1", "cmd-2"]
+
+
+def test_cancelled_running_task_still_starts_next(factory, tmp_path):
+    """人为取消当前任务 = 只跳过它，队列继续（「停止并清空队列」是另一个显式入口）。"""
+    manager, calls, _ = factory([FakeProcess(returncode=-15, delay=10**6), FakeProcess(0)])
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    wait_until(lambda: len(calls) == 1)
+
+    assert manager.cancel(first) is True
+    wait_until(lambda: manager.get_task(first)["state"] == "cancelled")
+    wait_until(lambda: manager.get_task(second)["state"] == "success")
+    assert [call["cmd"] for call in calls] == ["cmd-1", "cmd-2"]
+
+
+def test_cancel_pending_task_cancels_immediately_without_running(factory, tmp_path):
+    """取消排队中的任务：无需杀进程，立即落 cancelled 终态，且永远不会启动。"""
+    manager, calls, _ = factory(
+        [FakeProcess(0, delay=10**6), FakeProcess(0, delay=10**6)]
+    )
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    wait_until(lambda: len(calls) == 1)  # 子进程已启动（state==running 不代表 Popen 已发生）
+
+    assert manager.cancel(second) is True
+    assert manager.get_task(second)["state"] == "cancelled"
+    assert manager.get_task(second)["finished_at"] is not None
+    assert manager.get_task(second)["error"] is None
+
+    calls[0]["proc"].finish()
+    wait_until(lambda: manager.get_task(first)["state"] == "success")
+    assert len(calls) == 1  # second 从未启动，队列也没有把它调度起来
+
+
+def test_dispatch_skips_stale_terminal_entries(factory, tmp_path):
+    """调度器跳过队列里已非 pending 的陈旧条目（正常路径 cancel 会同步出队，
+    这里手动塞回模拟残留），且不阻断后续调度。"""
+    manager, calls, _ = factory(
+        [FakeProcess(0, delay=10**6), FakeProcess(0, delay=10**6)]
+    )
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    wait_until(lambda: len(calls) == 1)  # 子进程已启动
+
+    assert manager.cancel(second) is True
+    manager._queue.append(second)  # 模拟陈旧条目残留
+    calls[0]["proc"].finish()
+    wait_until(lambda: manager.get_task(first)["state"] == "success")
+    time.sleep(0.1)
+
+    assert manager.get_task(second)["state"] == "cancelled"  # 未被复活或重启
     assert len(calls) == 1
 
+
+def test_clear_queue_stops_running_and_cancels_pending(factory, tmp_path):
+    """「停止并清空队列」：当前任务走进程组终止，全部排队任务取消，不再启动任何进程。"""
+    manager, calls, kills = factory(
+        [FakeProcess(returncode=-15, delay=10**6), FakeProcess(0), FakeProcess(0)]
+    )
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    third = manager.create_task("index", ["cmd-3"], tmp_path / "c.log")
+    wait_until(lambda: manager.get_task(first)["state"] == "running")
+
+    result = manager.clear_queue()
+
+    assert result == {"stopped_task": first, "cancelled_pending": 2}
+    wait_until(lambda: manager.get_task(first)["state"] == "cancelled")
+    assert manager.get_task(second)["state"] == "cancelled"
+    assert manager.get_task(third)["state"] == "cancelled"
+    assert kills and kills[0][0] is calls[0]["proc"]
+    wait_until(lambda: threading.active_count() >= 0)
+    assert len(calls) == 1  # second/third 从未启动
+    assert all(
+        snapshot["queue_position"] is None for snapshot in manager.list_tasks()
+    )
+
+
+def test_clear_queue_stops_sole_running_task_when_queue_empty(factory, tmp_path):
+    """队列为空时 clear 只停当前任务（等价于 cancel），不要求存在排队任务。"""
+    manager, calls, _ = factory([FakeProcess(0, delay=10**6)])
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(first)["state"] == "running")
+
+    result = manager.clear_queue()
+
+    assert result == {"stopped_task": first, "cancelled_pending": 0}
+    wait_until(lambda: manager.get_task(first)["state"] == "cancelled")
+    assert len(calls) == 1
+
+
+def test_dispose_cancels_pending_tasks(factory, tmp_path):
+    """服务关闭：除终止正在跑的任务外，排队中的任务也必须落终态（不留悬队列）。"""
+    manager, calls, _ = factory(
+        [FakeProcess(0, delay=10**6), FakeProcess(0)]
+    )
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    wait_until(lambda: manager.get_task(first)["state"] == "running")
+
+    manager.dispose()
+
+    assert manager.get_task(first)["state"] == "cancelled"
+    assert manager.get_task(second)["state"] == "cancelled"
+    assert manager.get_task(second)["queue_position"] is None
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 2b. 队列持久化与恢复
+# ---------------------------------------------------------------------------
+
+
+def test_queue_store_persists_pending_records(factory, tmp_path):
+    """pending 集合是持久化快照的唯一内容：入队写入、出队启动移除、取消清空；
+    运行中任务不入文件（重启后需手动重新提交，靠 checkpoint 续训）。"""
+    store = FakeStore()
+    manager, calls, _ = factory(
+        [FakeProcess(0, delay=10**6), FakeProcess(0, delay=10**6)], queue_store=store
+    )
+    definition = {"kind": "fit", "body": {"exp_name": "mi-test"}}
+    first = manager.create_task(
+        "fit", ["cmd-1"], tmp_path / "a.log", definition=definition
+    )
+    wait_until(lambda: len(calls) == 1)  # 子进程已启动
+    assert store.saved[-1] == []  # 首任务即刻启动：pending 集合为空
+
+    second = manager.create_task(
+        "extract", ["cmd-2"], tmp_path / "b.log", definition={"kind": "extract"}
+    )
+    (record,) = store.saved[-1]
+    assert record["id"] == second
+    assert record["name"] == "extract"
+    assert record["cmds"] == ["cmd-2"]
+    assert record["log_path"] == str(tmp_path / "b.log")
+    assert record["truncate"] is True
+    assert record["definition"] == {"kind": "extract"}
+    assert isinstance(record["created_at"], float)
+
+    calls[0]["proc"].finish()
+    wait_until(lambda: manager.get_task(second)["state"] == "running")
+    assert store.saved[-1] == []  # 出队启动后文件收敛为空
+
+    assert manager.cancel(second) is True
+    wait_until(lambda: manager.get_task(second)["state"] == "cancelled")
+    assert store.saved[-1] == []
+
+
+def test_queue_store_persisted_on_pending_cancel_and_clear(factory, tmp_path):
+    store = FakeStore()
+    manager, calls, _ = factory(
+        [FakeProcess(0, delay=10**6), FakeProcess(0), FakeProcess(0)],
+        queue_store=store,
+    )
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    third = manager.create_task("index", ["cmd-3"], tmp_path / "c.log")
+    wait_until(lambda: manager.get_task(first)["state"] == "running")
+    assert [r["id"] for r in store.saved[-1]] == [second, third]
+
+    assert manager.cancel(second) is True
+    assert [r["id"] for r in store.saved[-1]] == [third]
+
+    manager.clear_queue()
+    assert store.saved[-1] == []
 
 # ---------------------------------------------------------------------------
 # 3. 终止
@@ -693,3 +897,127 @@ def test_current_cmd_keeps_last_index_after_success(factory, tmp_path):
     wait_until(lambda: manager.get_task(task_id)["state"] == "success")
 
     assert manager.get_task(task_id)["current_cmd"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 7. on_finish 终态回调（历史记录器的挂载点，design
+#    docs/plans/2026-09-09-task-centric-training-ui-design.md §3）
+# ---------------------------------------------------------------------------
+
+
+def test_on_finish_fires_once_per_terminal_state(factory, tmp_path):
+    manager, calls, _ = factory([FakeProcess(0), FakeProcess(0)])
+    seen = []
+    manager.on_finish = lambda snapshot: seen.append(snapshot)
+
+    first = manager.create_task(
+        "fit", ["cmd-1"], tmp_path / "a.log", definition={"kind": "fit"}
+    )
+    wait_until(lambda: manager.get_task(first)["state"] == "success")
+
+    second = manager.create_task("index", ["cmd-2"], tmp_path / "b.log")
+    wait_until(lambda: manager.get_task(second)["state"] == "success")
+
+    assert [s["id"] for s in seen] == [first, second]
+    assert seen[0]["state"] == "success"
+    assert seen[0]["definition"] == {"kind": "fit"}  # 快照携带 definition
+    assert seen[0]["logs"] == [] or isinstance(seen[0]["logs"], list)
+
+
+def test_on_finish_fires_for_failure_and_running_cancel(factory, tmp_path):
+    manager, calls, _ = factory(
+        [FakeProcess(returncode=3, delay=2), FakeProcess(returncode=-15, delay=10**6)]
+    )
+    seen = []
+    manager.on_finish = lambda snapshot: seen.append(snapshot["state"])
+
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(first)["state"] == "failed")
+
+    second = manager.create_task("extract", ["cmd-2"], tmp_path / "b.log")
+    wait_until(lambda: len(calls) == 2)
+    manager.cancel(second)
+    wait_until(lambda: manager.get_task(second)["state"] == "cancelled")
+
+    assert seen == ["failed", "cancelled"]
+
+
+def test_on_finish_runs_outside_lock(factory, tmp_path):
+    manager, _, _ = factory([FakeProcess(0, delay=10**6)])
+    lock_states = []
+    manager.on_finish = lambda snapshot: lock_states.append(manager._lock.locked())
+
+    task_id = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
+    manager.cancel(task_id)
+    wait_until(lambda: manager.get_task(task_id)["state"] == "cancelled")
+
+    assert lock_states == [False]  # 回调在锁外执行（记录器做文件 I/O 不持锁）
+
+
+def test_on_finish_exception_does_not_affect_task_or_queue(factory, tmp_path):
+    manager, calls, _ = factory(
+        [FakeProcess(0), FakeProcess(0, delay=10**6)]
+    )
+
+    def broken(snapshot):
+        raise RuntimeError("记录器故障")
+
+    manager.on_finish = broken
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(first)["state"] == "success")  # 终态照常落
+
+    second = manager.create_task("index", ["cmd-2"], tmp_path / "b.log")
+    wait_until(lambda: manager.get_task(second)["state"] == "running")  # 队列照常推进
+
+
+def test_on_finish_fires_for_cancelled_pending_task(factory, tmp_path):
+    manager, calls, _ = factory([FakeProcess(0, delay=10**6)])
+    seen = []
+    manager.on_finish = lambda snapshot: seen.append((snapshot["id"], snapshot["state"]))
+
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("index", ["cmd-2"], tmp_path / "b.log")
+    wait_until(lambda: manager.get_task(first)["state"] == "running")
+
+    manager.cancel(second)  # 排队任务取消（绕过 _finish 的路径）
+    assert seen == [(second, "cancelled")]
+
+
+def test_on_finish_fires_for_all_tasks_on_clear_queue(factory, tmp_path):
+    manager, calls, _ = factory(
+        [FakeProcess(returncode=-15, delay=10**6), FakeProcess(0), FakeProcess(0)]
+    )
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("index", ["cmd-2"], tmp_path / "b.log")
+    third = manager.create_task("fit", ["cmd-3"], tmp_path / "c.log")
+    wait_until(lambda: manager.get_task(first)["state"] == "running")
+
+    seen = []
+    manager.on_finish = lambda snapshot: seen.append((snapshot["id"], snapshot["state"]))
+    manager.clear_queue()
+    wait_until(lambda: manager.get_task(first)["state"] == "cancelled")
+
+    assert (second, "cancelled") in seen
+    assert (third, "cancelled") in seen
+
+
+def test_on_finish_fires_for_pending_and_running_on_dispose(factory, tmp_path):
+    manager, calls, _ = factory(
+        [FakeProcess(0, delay=10**6), FakeProcess(0, delay=10**6)]
+    )
+    first = manager.create_task("fit", ["cmd-1"], tmp_path / "a.log")
+    second = manager.create_task("index", ["cmd-2"], tmp_path / "b.log")
+    wait_until(lambda: manager.get_task(first)["state"] == "running")
+
+    seen = []
+    manager.on_finish = lambda snapshot: seen.append((snapshot["id"], snapshot["state"]))
+    manager.dispose()
+
+    expected = [(first, "cancelled"), (second, "cancelled")]
+    assert sorted(seen) == sorted(expected)
+
+
+def test_on_finish_none_is_noop(factory, tmp_path):
+    manager, _, _ = factory([FakeProcess(0)])
+    task_id = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(task_id)["state"] == "success")  # 不回调也不报错

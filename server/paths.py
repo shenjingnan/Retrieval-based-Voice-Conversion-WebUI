@@ -17,3 +17,14 @@ LOGS_DIR = ROOT / "logs"
 # 训练侧拿到的是其中某个子目录的绝对路径（作为 dataset_dir 传给 preprocess）
 DATASETS_DIR = ROOT / "datasets"
 STATIC_DIR = Path(__file__).resolve().parent / "static"  # 前端构建产物，可能不存在
+
+
+def queue_file() -> Path:
+    """训练任务队列持久化文件（server/task_store.py 的默认落点，logs/ 已 gitignore）。
+    用函数而非常量：测试把 ROOT monkeypatch 到 tmp 后此处跟随，测试不触碰真实 logs/。"""
+    return ROOT / "logs" / "task_queue.json"
+
+
+def history_file() -> Path:
+    """训练历史记录文件（TaskHistoryStore 默认落点，同 queue_file 的函数式理由）。"""
+    return ROOT / "logs" / "task_history.json"

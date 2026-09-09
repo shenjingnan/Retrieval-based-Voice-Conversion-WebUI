@@ -4,6 +4,7 @@ import errno
 import io
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -729,22 +730,120 @@ def test_delete_traversal_encoded_names_rejected(client, encoded):
     assert client.delete("/api/datasets/" + encoded).status_code == 400
 
 
-def test_delete_blocked_while_task_active(client, monkeypatch):
+def _cmd_referencing(directory) -> str:
+    """模拟 preprocess/pipeline 的 cmd：数据集目录以双引号内嵌（护栏按此匹配）。"""
+    return '"%s" train/preprocess.py "%s"' % (sys.executable, directory)
+
+
+def test_delete_blocked_while_task_references_dataset(client, monkeypatch):
+    """删除互斥是引用级的：非终态任务的 cmds 引用了该数据集目录才拒删
+    （排队中的 preprocess/pipeline 还等着读它）。"""
     dataset = paths.DATASETS_DIR / "alice"
     _write_wav(dataset / "a.wav")
 
     from server.api import datasets as datasets_api
 
     def fake_list_tasks():
-        return [{"id": "t1", "name": "exp_a", "state": "running"}]
+        return [
+            {
+                "id": "t1",
+                "name": "pipeline",
+                "state": "running",
+                "cmds": [_cmd_referencing(paths.DATASETS_DIR / "alice")],
+            }
+        ]
 
     monkeypatch.setattr(datasets_api.task_manager, "list_tasks", fake_list_tasks)
 
     resp = client.delete("/api/datasets/alice")
 
     assert resp.status_code == 409
-    assert "exp_a" in resp.json()["detail"]
+    assert "pipeline" in resp.json()["detail"]  # 409 文案带占用任务名
     assert dataset.exists()  # 互斥拦截：目录原样保留
+
+
+def test_delete_blocked_while_queued_task_references_dataset(client, monkeypatch):
+    dataset = paths.DATASETS_DIR / "alice"
+    _write_wav(dataset / "a.wav")
+
+    from server.api import datasets as datasets_api
+
+    def fake_list_tasks():
+        return [
+            {
+                "id": "t2",
+                "name": "pipeline",
+                "state": "pending",
+                "cmds": [_cmd_referencing(paths.DATASETS_DIR / "alice")],
+            }
+        ]
+
+    monkeypatch.setattr(datasets_api.task_manager, "list_tasks", fake_list_tasks)
+
+    assert client.delete("/api/datasets/alice").status_code == 409
+
+
+def test_delete_allowed_when_active_task_references_other_dataset(client, monkeypatch):
+    """排队开放后的核心场景：任务 A 运行中时准备任务 B 的数据——运行/排队任务
+    未引用的数据集可以随意删除。"""
+    dataset = paths.DATASETS_DIR / "alice"
+    _write_wav(dataset / "a.wav")
+
+    from server.api import datasets as datasets_api
+
+    def fake_list_tasks():
+        return [
+            {
+                "id": "t1",
+                "name": "pipeline",
+                "state": "running",
+                "cmds": [_cmd_referencing(paths.DATASETS_DIR / "bob")],  # 另一个数据集
+            }
+        ]
+
+    monkeypatch.setattr(datasets_api.task_manager, "list_tasks", fake_list_tasks)
+
+    resp = client.delete("/api/datasets/alice")
+
+    assert resp.status_code == 200
+    assert not dataset.exists()
+
+
+def test_delete_allowed_when_active_task_has_no_dataset_cmd(client, monkeypatch):
+    """fit/index 类任务只引用 logs/{exp} 产物，不构成对原始数据集的互斥。"""
+    dataset = paths.DATASETS_DIR / "alice"
+    _write_wav(dataset / "a.wav")
+
+    from server.api import datasets as datasets_api
+
+    def fake_list_tasks():
+        return [{"id": "t1", "name": "fit", "state": "running", "cmds": ['"py" train/train.py -e e']}]
+
+    monkeypatch.setattr(datasets_api.task_manager, "list_tasks", fake_list_tasks)
+
+    assert client.delete("/api/datasets/alice").status_code == 200
+
+
+def test_delete_path_prefix_does_not_match_sibling_dataset(client, monkeypatch):
+    """alice 与 alice2 是相邻目录：双引号包夹匹配，前缀命中不得误伤兄弟数据集。"""
+    dataset = paths.DATASETS_DIR / "alice"
+    _write_wav(dataset / "a.wav")
+
+    from server.api import datasets as datasets_api
+
+    def fake_list_tasks():
+        return [
+            {
+                "id": "t1",
+                "name": "pipeline",
+                "state": "running",
+                "cmds": [_cmd_referencing(paths.DATASETS_DIR / "alice2")],
+            }
+        ]
+
+    monkeypatch.setattr(datasets_api.task_manager, "list_tasks", fake_list_tasks)
+
+    assert client.delete("/api/datasets/alice").status_code == 200
 
 
 def test_delete_allowed_when_tasks_are_terminal(client, monkeypatch):
@@ -937,7 +1036,7 @@ def test_separate_creates_task_with_default_model(client, monkeypatch):
 
     seen = {}
 
-    def fake_create(name, cmds, log_path, truncate=True, setup=None):
+    def fake_create(name, cmds, log_path, truncate=True, setup=None, **kwargs):
         seen.update(name=name, cmds=list(cmds), log_path=Path(log_path))
         return "task-1"
 
@@ -976,7 +1075,7 @@ def test_separate_explicit_model_passthrough(client, monkeypatch):
     monkeypatch.setattr(
         datasets_api.task_manager,
         "create_task",
-        lambda name, cmds, log_path, truncate=True, setup=None: seen.update(
+        lambda name, cmds, log_path, truncate=True, setup=None, **kwargs: seen.update(
             cmds=list(cmds)
         ) or "task-1",
     )
@@ -1017,22 +1116,54 @@ def test_separate_empty_dataset_returns_400(client):
     assert "没有可分离的音频文件" in resp.json()["detail"]
 
 
-def test_separate_conflict_maps_to_409(client, monkeypatch):
-    """与训练共用全局互斥：TaskConflictError → 409，文案原样透出。"""
+def test_separate_queues_while_training_active(client, monkeypatch):
+    """与训练共用串行队列：训练任务非终态时提交分离 → 200 且任务排队（不再 409
+    拒绝），响应带 queued / queue_position 供前端提示。"""
     _make_dataset("alice")
 
     from server.api import datasets as datasets_api
-    from server.tasks import TaskConflictError
 
-    def conflicting_create(name, cmds, log_path, truncate=True, setup=None):
-        raise TaskConflictError("已有训练任务在运行（fit，id=t9），请等待完成或先停止")
-
-    monkeypatch.setattr(datasets_api.task_manager, "create_task", conflicting_create)
+    monkeypatch.setattr(
+        datasets_api.task_manager,
+        "create_task",
+        lambda name, cmds, log_path, truncate=True, setup=None, **kwargs: "task-9",
+    )
+    monkeypatch.setattr(
+        datasets_api.task_manager,
+        "get_task",
+        lambda task_id: {"id": task_id, "state": "pending", "queue_position": 1},
+    )
 
     resp = client.post("/api/datasets/alice/separate", json={})
 
-    assert resp.status_code == 409
-    assert "已有训练任务在运行" in resp.json()["detail"]
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["task_id"] == "task-9"
+    assert body["queued"] is True
+    assert body["queue_position"] == 1
+    assert body["output_dataset"] == "alice_vocals"
+
+
+def test_separate_runs_immediately_when_idle(client, monkeypatch):
+    _make_dataset("alice")
+
+    from server.api import datasets as datasets_api
+
+    monkeypatch.setattr(
+        datasets_api.task_manager,
+        "create_task",
+        lambda name, cmds, log_path, truncate=True, setup=None, **kwargs: "task-9",
+    )
+    monkeypatch.setattr(
+        datasets_api.task_manager,
+        "get_task",
+        lambda task_id: {"id": task_id, "state": "running", "queue_position": None},
+    )
+
+    body = client.post("/api/datasets/alice/separate", json={}).json()
+
+    assert body["queued"] is False
+    assert body["queue_position"] is None
 
 
 def test_list_and_detail_report_derived_from(client):
@@ -1135,7 +1266,7 @@ def test_delete_file_invalid_names_rejected(client, bad):
     assert client.delete(f"/api/datasets/alice/files/{bad}").status_code == 400
 
 
-def test_delete_file_blocked_while_task_active(client, monkeypatch):
+def test_delete_file_blocked_while_task_references_dataset(client, monkeypatch):
     _make_dataset("alice", files=("a.wav",))
 
     from server.api import datasets as datasets_api
@@ -1143,13 +1274,44 @@ def test_delete_file_blocked_while_task_active(client, monkeypatch):
     monkeypatch.setattr(
         datasets_api.task_manager,
         "list_tasks",
-        lambda: [{"id": "t1", "name": "preprocess", "state": "running"}],
+        lambda: [
+            {
+                "id": "t1",
+                "name": "preprocess",
+                "state": "running",
+                "cmds": [_cmd_referencing(paths.DATASETS_DIR / "alice")],
+            }
+        ],
     )
 
     resp = client.delete("/api/datasets/alice/files/a.wav")
 
     assert resp.status_code == 409
     assert (paths.DATASETS_DIR / "alice" / "a.wav").exists()  # 互斥拦截：文件原样保留
+
+
+def test_delete_file_allowed_when_task_references_other_dataset(client, monkeypatch):
+    _make_dataset("alice", files=("a.wav",))
+
+    from server.api import datasets as datasets_api
+
+    monkeypatch.setattr(
+        datasets_api.task_manager,
+        "list_tasks",
+        lambda: [
+            {
+                "id": "t1",
+                "name": "preprocess",
+                "state": "running",
+                "cmds": [_cmd_referencing(paths.DATASETS_DIR / "bob")],
+            }
+        ],
+    )
+
+    resp = client.delete("/api/datasets/alice/files/a.wav")
+
+    assert resp.status_code == 200
+    assert not (paths.DATASETS_DIR / "alice" / "a.wav").exists()
 
 
 def test_delete_file_with_unicode_and_space_name(client):
@@ -1173,7 +1335,7 @@ def test_separate_with_file_subset_builds_file_args(client, monkeypatch):
     monkeypatch.setattr(
         datasets_api.task_manager,
         "create_task",
-        lambda name, cmds, log_path, truncate=True, setup=None: seen.update(
+        lambda name, cmds, log_path, truncate=True, setup=None, **kwargs: seen.update(
             cmds=list(cmds)
         )
         or "task-1",

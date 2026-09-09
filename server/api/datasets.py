@@ -25,9 +25,18 @@ from server.commands import build_separate_cmd
 from server.api.training import _EXP_FORBIDDEN
 # 删除互斥的判定依据：任务状态机常量与进程级任务表单例（server.tasks 顶层不加载
 # torch，与 server.main 的导入深度一致，pytest 收集期安全）
-from server.tasks import TERMINAL_STATES, TaskConflictError, task_manager
+from server.tasks import PENDING, RESTORE_FACTORIES, TERMINAL_STATES, task_manager
 
 logger = logging.getLogger(__name__)
+
+
+def _restore_separate_task(definition: dict):
+    """separate kind 的启动恢复工厂（server.tasks.RESTORE_FACTORIES 注册）：
+    cmds/log_path 已随记录持久化，衍生标记在原创建时已写入，无需重建任何东西。"""
+    return None, None
+
+
+RESTORE_FACTORIES["separate"] = _restore_separate_task
 
 router = APIRouter(prefix="/api/datasets")
 
@@ -543,11 +552,12 @@ def separate_dataset(name: str, body: SeparateBody):
     文件（前端逐文件分离入口；产物落到同一衍生目录，按文件幂等天然衔接后续的全量
     分离——已分离过的文件自动跳过）。
 
-    与训练共用 task_manager 全局互斥（409）——分离与训练都是重负载任务，Mac 统一
-    内存/显存不允许并发；这也让 delete_dataset 的「任务进行中 409 拒删」自动覆盖
-    分离中的源与衍生数据集。产物按文件幂等（已存在的目标 stem 跳过），任务失败或
-    中断后重新发起即续跑，不需要额外参数。衍生标记在建任务时写入（而非成功终态）：
-    列表的血缘徽章对失败重跑同样有意义，且与目录由 runner 启动即创建的时序一致。
+    与训练共用 task_manager 串行队列（训练任务运行中时本任务自动排队，不再 409
+    拒绝——分离与训练都是重负载任务，Mac 统一内存/显存不允许并发，但排队可以）；
+    这也让 delete_dataset 的「任务进行中 409 拒删」自动覆盖分离中的源与衍生数据集。
+    产物按文件幂等（已存在的目标 stem 跳过），任务失败或中断后重新发起即续跑，
+    不需要额外参数。衍生标记在建任务时写入（而非成功终态）：列表的血缘徽章对
+    失败重跑同样有意义，且与目录由 runner 启动即创建的时序一致。
     """
     directory = _dataset_dir(name)  # 非法名 → 400
     if not directory.is_dir():
@@ -579,26 +589,68 @@ def separate_dataset(name: str, body: SeparateBody):
     # 任务日志放 .meta（数据集目录之外，与衍生标记同理）；truncate 默认 True：
     # 每次发起都是全新日志，与训练各阶段的截断语义一致
     log_path = paths.DATASETS_DIR / META_DIRNAME / ("%s.separate.log" % name)
-    try:
-        task_id = task_manager.create_task("separate", [cmd], log_path)
-    except TaskConflictError as exc:
-        raise HTTPException(409, str(exc))
+    task_id = task_manager.create_task(
+        "separate",
+        [cmd],
+        log_path,
+        definition={
+            "kind": "separate",
+            "input_dir": str(directory),
+            "output_dir": str(output_dir),
+            "model": body.model,
+            "files": list(files or []),
+        },
+    )
     _write_derived_marker(output_name, name, body.model)
+    snapshot = task_manager.get_task(task_id) or {}
     return {
         "task_id": task_id,
+        "queued": snapshot.get("state") == PENDING,
+        "queue_position": snapshot.get("queue_position"),
         "output_dataset": output_name,
         "output_path": str(output_dir),
     }
+
+
+def _referencing_task(directory: Path):
+    """返回第一个在 cmds 里引用该数据集目录的非终态任务（无则 None）。
+
+    排队机制开放后（docs/plans/2026-09-09-training-queue-design.md §2），「当前任务
+    运行中、准备下一个任务的数据」是核心场景，删除互斥从「有任何非终态任务就拒」
+    收窄为「引用了该数据集才拒」：
+    - preprocess/pipeline 的 cmds 内嵌源数据集目录（排队中同样拦——待跑的切分正
+      等着读它）；extract/fit/index 只引用 logs/{exp} 产物，删原始数据集不影响
+    - separate 的 cmds 内嵌源与衍生目录，两者在占用期内都删不得
+    匹配用双引号包夹（命令模板以 '"<path>"' 内嵌路径），alice 不会误伤 alice2。"""
+    marker = '"%s"' % directory
+    for task in task_manager.list_tasks():
+        if task["state"] in TERMINAL_STATES:
+            continue
+        if any(marker in cmd for cmd in task["cmds"]):
+            return task
+    return None
+
+
+def _ensure_dataset_idle(directory: Path, name: str) -> None:
+    """数据集（整目录或其中文件）被非终态任务引用时 409 拒删。"""
+    busy = _referencing_task(directory)
+    if busy is not None:
+        phase = "运行中" if busy["state"] == "running" else "排队中"
+        raise HTTPException(
+            409,
+            "数据集 %s 正在被%s的任务使用（%s），不能删除；请先停止该任务或等待完成"
+            % (name, phase, busy["name"]),
+        )
 
 
 @router.delete("/{name}/files/{filename}")
 def delete_dataset_file(name: str, filename: str):
     """删除数据集内的单个音频文件（上传错了/多传了的就地纠错）。
 
-    互斥口径与整目录删除一致：任何训练类任务非终态时 409 拒删——preprocess 正在
-    遍历该目录时不能动里面的文件，宁可误拦（用户可停任务后重试）。删除最后一个
-    文件后目录为空则连目录一起移除（与上传「不留空目录」同一纪律），目录消失时
-    .meta 下的侧车/标记/日志一并清理，不让列表留下 0 文件的空壳。
+    互斥口径与整目录删除一致（引用级，见 _referencing_task）：正被非终态任务读取
+    的数据集拒删，无关数据集不受任务影响。删除最后一个文件后目录为空则连目录一起
+    移除（与上传「不留空目录」同一纪律），目录消失时 .meta 下的侧车/标记/日志一并
+    清理，不让列表留下 0 文件的空壳。
     """
     directory = _dataset_dir(name)  # 非法名 → 400
     # filename 校验：路由参数本身不含路径分隔符（单段），这里拒点开头与 NUL——
@@ -613,15 +665,7 @@ def delete_dataset_file(name: str, filename: str):
         raise HTTPException(400, "文件名非法：%r" % filename)
     if not directory.is_dir():
         raise HTTPException(404, "数据集不存在：%s" % name)
-    active = [
-        task for task in task_manager.list_tasks() if task["state"] not in TERMINAL_STATES
-    ]
-    if active:
-        raise HTTPException(
-            409,
-            "训练任务进行中（%s），不能删除文件；请先停止或等待任务完成"
-            % active[0]["name"],
-        )
+    _ensure_dataset_idle(directory, name)
     target = directory / filename
     if not target.is_file():
         raise HTTPException(404, "文件不存在：%s" % filename)
@@ -699,8 +743,8 @@ def _rmtree_best_effort(directory: Path, failed_files: list) -> None:
 
 @router.delete("/{name}")
 def delete_dataset(name: str):
-    """删除数据集目录与侧车。训练任务非终态时 409 拒删——不解析 cmds 是否引用该
-    数据集，宁可误拦（用户可停任务后重试），也不冒删掉正在被读的目录的风险。
+    """删除数据集目录与侧车。删除互斥是引用级的（_referencing_task）：正被非终态
+    任务读取的数据集 409 拒删，不冒删掉正在被读的目录的风险；无关数据集不受影响。
 
     删除是尽力而为：单个文件删不掉（占用/权限）不回滚也不 500，残留项进
     failed_files 如实上报（models.delete_model 同纪律）；目录整体无法推进且无
@@ -709,15 +753,7 @@ def delete_dataset(name: str):
     directory = _dataset_dir(name)  # 非法名 → 400
     if not directory.is_dir():
         raise HTTPException(404, "数据集不存在：%s" % name)
-    active = [
-        task for task in task_manager.list_tasks() if task["state"] not in TERMINAL_STATES
-    ]
-    if active:
-        raise HTTPException(
-            409,
-            "训练任务进行中（%s），不能删除数据集 %s；请先停止或等待任务完成"
-            % (active[0]["name"], name),
-        )
+    _ensure_dataset_idle(directory, name)
 
     failed_files: list = []
     try:
