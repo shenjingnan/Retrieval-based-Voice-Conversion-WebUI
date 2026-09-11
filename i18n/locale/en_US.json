@@ -16,6 +16,7 @@
     "SOLA偏移：%d": "SOLA offset: %d",
     "[F0提取] 完成 | 成功：%s | 跳过：%s | 失败：%s": "[F0 extraction] Completed | Success: %s | Skipped: %s | Failed: %s",
     "[F0提取] 待处理：%s": "[F0 extraction] Pending: %s",
+    "[F0提取] 可用内存不足，并发从 %s 降为 %s（每进程预留 2GB）": "[F0 extraction] Not enough free memory: reduced concurrency from %s to %s (2GB budget per worker)",
     "[F0提取] 无待处理音频，已全部跳过": "[F0 extraction] No pending audio; all files were skipped",
     "[F0提取] 进度：%s/%s | 成功：%s | 跳过：%s | %s": "[F0 extraction] Progress: %s/%s | Success: %s | Skipped: %s | %s",
     "[F0提取][失败] %s": "[F0 extraction][Failed] %s",

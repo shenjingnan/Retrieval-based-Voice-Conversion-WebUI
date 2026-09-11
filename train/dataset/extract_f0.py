@@ -24,6 +24,11 @@ if mode == "cpu":
     f0method = sys.argv[4]
     device = "cpu"
     is_half = False
+    # cpu 模式的每个 worker 都是 spawn 出来的独立进程：若放行 CUDA，infer.audio
+    # 会在每个 worker 里为重采样各建一份 CUDA context（数 GB 提交内存），并发一多
+    # 就打穿系统提交上限（WinError 1450/1455「页面文件太小」）。RMVPE 本就跑在
+    # CPU 上，重采样退回 ffmpeg 解码即可，因此在 infer.audio 导入 torch 前屏蔽 GPU。
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 elif mode == "cuda":
     n_part = int(sys.argv[2])
     i_part = int(sys.argv[3])
@@ -53,6 +58,56 @@ def printt(strr):
     print(strr)
     f.write("%s\n" % strr)
     f.flush()
+
+
+# cpu 模式的每个 worker 都要完整加载 torch，并发过猛会打穿「物理内存 + 页面文件」
+# 的提交额度（表现为 WinError 1450/1455、DLL 加载失败、numpy 连几十 KB 都分配不
+# 出）。按每个 worker 2GB 提交预算、可用内存打 3/4 折来封顶并发。
+_F0_WORKER_COMMIT_BUDGET = 2 * 1024**3
+
+
+def _available_memory_bytes():
+    """可用物理内存（字节）。psutil 优先；缺失时 Windows 退回 ctypes 的
+    GlobalMemoryStatusEx，POSIX 用 sysconf。都不可用返回 None（保守处理）。"""
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MemoryStatusEx()
+            stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+            return None
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except Exception:
+        return None
+
+
+def _max_workers_by_memory():
+    """F0 提取（cpu 模式）的内存安全并发上限；读不到内存信息时保守取 2。"""
+    available = _available_memory_bytes()
+    if available is None:
+        return 2
+    return max(1, available * 3 // 4 // _F0_WORKER_COMMIT_BUDGET)
 class FeatureInput(object):
     def __init__(self, samplerate=16000, hop_size=160):
         self.fs = samplerate
@@ -200,6 +255,13 @@ if __name__ == "__main__":
             featureInput.go([], f0method, 1)
         else:
             worker_count = min(max(1, n_p), len(paths))
+            mem_cap = _max_workers_by_memory()
+            if mem_cap < worker_count:
+                printt(
+                    i18n("[F0提取] 可用内存不足，并发从 %s 降为 %s（每进程预留 2GB）")
+                    % (worker_count, mem_cap)
+                )
+                worker_count = mem_cap
             ps = []
             for i in range(worker_count):
                 p = Process(

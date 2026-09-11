@@ -119,6 +119,15 @@ _VERSIONS = frozenset({"v1", "v2"})
 _SR_KEYS = frozenset(SR_DICT)
 
 
+def _dump_body(body: BaseModel) -> dict:
+    """请求体 → 可序列化 dict，兼容 pydantic v1/v2。model_dump() 是 v2 API，服务
+    .venv 里是 pydantic 1.10（老 webui 的 gradio 3.14 连带钉死 fastapi 0.99），v1 下
+    直接调 model_dump 会 AttributeError → 500（开发环境跑测试用的是 v2，故测试未拦截）。
+    v2 在位时优先走 v2 路径，环境升级后无需改这里。"""
+    dumper = getattr(body, "model_dump", None)
+    return dumper() if dumper is not None else body.dict()
+
+
 def _check_exp_name(value: str) -> str:
     """非空、无路径分量（防穿越）、无引号/反斜杠/空白（防 shell 注入）。
     "." 与 ".." 单独拒绝：Python 3.13 起 Path("..").name 返回 ".."，不再能靠 name 兜住。
@@ -530,7 +539,7 @@ def start_preprocess(body: PreprocessBody):
         [cmd],
         _task_log(exp_name, "preprocess.log"),
         meta={"exp_name": exp_name},
-        definition={"kind": "preprocess", "body": body.model_dump()},
+        definition={"kind": "preprocess", "body": _dump_body(body)},
     )
 
 
@@ -551,7 +560,7 @@ def start_extract(body: ExtractBody):
         _task_log(exp_name, "extract_f0_feature.log"),
         setup=_preprocess_check_setup(exp_dir),
         meta={"exp_name": exp_name},
-        definition={"kind": "extract", "body": body.model_dump()},
+        definition={"kind": "extract", "body": _dump_body(body)},
     )
 
 
@@ -578,7 +587,7 @@ def start_fit(body: FitBody):
         _task_log(exp_name, "train_task_fit.log"),
         setup=_fit_setup(exp_dir, sr, version, body.if_f0, batch_note),
         meta={"total_epoch": body.total_epoch, "exp_name": exp_name},
-        definition={"kind": "fit", "body": body.model_dump(), "batch_note": batch_note},
+        definition={"kind": "fit", "body": _dump_body(body), "batch_note": batch_note},
     )
 
 
@@ -625,7 +634,7 @@ def start_index(body: IndexBody):
         [cmd],
         _task_log(exp_name, "train_index.log"),
         meta={"exp_name": exp_name},
-        definition={"kind": "index", "body": body.model_dump()},
+        definition={"kind": "index", "body": _dump_body(body)},
     )
 
 
@@ -678,7 +687,7 @@ def start_pipeline(body: PipelineBody):
         },
         definition={
             "kind": "pipeline",
-            "body": body.model_dump(),
+            "body": _dump_body(body),
             "batch_note": batch_note,
             "pipeline_stages": stages,
         },

@@ -22,6 +22,7 @@ pytest 收集期不得加载 torch）。
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import subprocess
@@ -53,6 +54,65 @@ TRAIN_CMD_MARKER = "train/train.py"
 LOG_BUFFER_MAXLEN = 1000
 # 任务失败时 error 携带的日志尾部行数（设计 §4：detail 带日志尾部 + returncode）
 ERROR_LOG_TAIL_LINES = 20
+
+# 每个 cmd 启动前的可用提交内存下限（Windows 的提交额度 = 物理内存 + 页面文件；
+# 其他平台退化为 psutil 的 RAM available）。训练子进程要整体加载 scipy/av/torch
+# （单进程数百 MB 提交，preprocess 还会按 CPU 核数并发拉起多个），额度见底时它们
+# 会在 import 阶段集体报「页面文件太小，无法完成操作」——宁可在此拦下并给出人话。
+# 启发值：足以覆盖典型 4 核小机的预处理并发；更大规模下进程数增多时同一额度依然
+# 只是把「必崩」提前为「明确失败」，不追求精确预测。
+_MIN_CMD_HEADROOM_BYTES = 2 * 1024**3
+
+
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+def _available_commit_bytes() -> int | None:
+    """当前进程可用的提交内存额度（字节）；拿不到返回 None（守卫跳过）。
+
+    Windows 直查 GlobalMemoryStatusEx 的 ullAvailPageFile——正是「页面文件太小」
+    报错对应的那个额度（RAM + 页面文件 的未提交余量）；其余平台用 psutil 的
+    RAM available（Mac 统一内存即同物），psutil 缺失或失败一律降级为不检查：
+    守卫是兜底提示，不能反过来挡住正常任务。"""
+    if os.name == "nt":
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullAvailPageFile)
+        return None
+    try:
+        import psutil
+    except Exception:  # noqa: BLE001 未安装即不检查（server.api.system 同款降级纪律）
+        return None
+    try:
+        return int(psutil.virtual_memory().available)
+    except Exception:  # noqa: BLE001 受限环境（容器/权限）下 psutil 会抛
+        return None
+
+
+def _headroom_error() -> str | None:
+    """额度不足时返回人话失败信息，充足或无法判定时返回 None。"""
+    available = _available_commit_bytes()
+    if available is None or available >= _MIN_CMD_HEADROOM_BYTES:
+        return None
+    return (
+        "系统可用内存不足（剩余 %.1f GB，低于启动子进程所需的 %.1f GB 保底线），"
+        "继续执行大概率以「页面文件太小，无法完成操作」崩溃。"
+        "请关闭其他占用内存的程序（如旧版 webui、大页面浏览器），"
+        "或重启本服务释放长期驻留的模型缓存后重试；Windows 也可调大虚拟内存（页面文件）。"
+        % (available / 1024**3, _MIN_CMD_HEADROOM_BYTES / 1024**3)
+    )
 
 #: 启动恢复的 kind 注册表：kind → 工厂(definition) -> (setup, meta)。
 #: 恢复由 API 层编排（server.api.training.restore_pending_tasks）：cmds/log_path 等
@@ -158,6 +218,11 @@ class TaskManager:
         #: §3）：任务落终态时以快照（含 definition/logs）调用，锁外执行、异常降级为
         #: 日志。训练模块用它挂历史记录器；None 表示无回调。
         self.on_finish = None
+        #: 启动回调：任务工作线程起跑后、setup 与首个 cmd 之前以任务对象调用一次
+        #: （锁外执行，异常降级为日志）。返回值若是 str / str 列表，作为提示行写进
+        #: 任务日志缓冲（推理编排层用它挂「释放推理模型缓存」，其摘要行进日志）；
+        #: None 表示无回调。时序在 on_start 里释放内存，子进程启动时才能拿到额度。
+        self.on_start = None
         self._lock = threading.Lock()
         self._tasks = {}  # task_id -> _Task（dict 保序，list_tasks 按创建序输出）
         self._active_id = None  # 当前 running 任务的 id（串行执行的载体）
@@ -430,6 +495,14 @@ class TaskManager:
                 task.state = RUNNING
                 task.started_at = time.time()
 
+            if self.on_start is not None:
+                try:
+                    start_note = self.on_start(task)
+                except Exception:  # noqa: BLE001 启动钩子兜底：故障只记日志
+                    logger.exception("on_start 回调异常（任务 %s）", task.id)
+                else:
+                    self._append_setup_output(task, start_note)
+
             if task.setup is not None:
                 try:
                     setup_output = task.setup()
@@ -446,6 +519,12 @@ class TaskManager:
             for step, cmd in enumerate(task.cmds, start=1):
                 if task.stop_event.is_set():  # 每个 cmd 起前都检查（pipeline 提前收尾）
                     self._finish(task, CANCELLED, None)
+                    return
+                headroom_error = _headroom_error()
+                if headroom_error is not None:
+                    # 取消请求优先于守卫失败：置了停止标志的任务按 cancelled 收场，
+                    # 不冒充成内存不足
+                    self._finish(task, FAILED, headroom_error)
                     return
                 with self._lock:
                     task.current_cmd = step
