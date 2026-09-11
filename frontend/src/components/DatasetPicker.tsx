@@ -1,7 +1,9 @@
 /**
  * 参考音频上传控件（训练向导「参考音频」字段的主控件；后端与 API 沿用
  * dataset 命名，用户可见文案统一叫「参考音频」）：
- * 唯一主动作是**拖入即传**（顺序逐文件上传，带逐文件状态预览列表），目标目录自动
+ * 唯一主动作是**拖入/点击即传**（整个虚线区都是热区；并发逐文件上传，至多
+ * UPLOAD_CONCURRENCY 个同时传输，
+ * 带逐文件状态预览列表），目标目录自动
  * 生成随机编号（ds-xxxxxxxx），用户不需要命名。界面不渲染「已有参考音频」列表——
  * 训练素材就是本次上传的内容（分离完成则自动切到分离副本）；历史目录仍留在服务器
  * datasets/ 下，由 API 管理（DELETE /api/datasets/{name}），界面不再提供入口。
@@ -20,6 +22,7 @@ import {
   formatDuration,
   randomHex,
 } from '@/lib/domain'
+import { pumpPool } from '@/lib/uploadPool'
 import { errorMessage } from '@/lib/utils'
 import { useTask } from '@/hooks/useTask'
 import { Button } from '@/components/ui/button'
@@ -42,6 +45,12 @@ export interface DatasetPickerProps {
    */
   onUploadBusyChange?: (busy: boolean) => void
 }
+
+/** 同一时刻至多几个上传 XHR 在途。生产是同源 HTTP/1.1（uvicorn），浏览器对同源
+ *  约 6 个并发连接：5 个上传在途时还留 1 个槽给任务轮询等其余 API 请求，再多会
+ *  挤占轮询。并发的主要收益在局域网/远程访问——单流受 TCP 窗口与 RTT 限制跑不满
+ *  带宽，多流才能提速；后端对并发上传已是安全的（O_EXCL 独占创建、原子缓存写） */
+const UPLOAD_CONCURRENCY = 5
 
 /** 正被监视的分离任务；sourceName/outputName 在页面重挂恢复时无法还原（任务摘要不带
  * 业务字段，从命令串解析过于脆弱），此时只监视进度、终态不自动选中 */
@@ -199,8 +208,8 @@ export function DatasetPicker({
 
   // -- 上传会话 -------------------------------------------------------------
 
-  /** 泵送中标志：保证同一时刻只有一个 pump 循环在跑（addFiles/重试并发触发时，
-   *  后来者直接返回——循环每轮都会重新扫描 queued，不会漏文件） */
+  /** 泵送中标志：保证同一时刻只有一组 pump worker 在跑（addFiles/重试并发触发时，
+   *  后来者直接返回——worker 每轮都会重新扫描 queued，不会漏文件） */
   const pumping = useRef(false)
 
   function patchUpload(key: string, patch: Partial<UploadItem>) {
@@ -220,40 +229,47 @@ export function DatasetPicker({
     return sessionNameRef.current
   }
 
-  /** 顺序上传泵：同一时刻只有一个 XHR 在途——逐文件独立进度与 500MB 限额，单个
-   *  失败不拖垮整批。addFiles / 重试都会触发；已在泵送时直接返回（循环自己会捞
-   *  到新排队的文件）。卸载后在途 XHR 照常传完（abort 会把切 Tab 误当成失败），
-   *  迟到的 patch 由 mounted 短路丢弃。 */
+  /** 并发上传泵：至多 UPLOAD_CONCURRENCY 个 XHR 同时在途——逐文件独立进度与
+   *  500MB 限额，单个失败不拖垮整批。addFiles / 重试都会触发；已在泵送时直接返回
+   *  （worker 自己会捞到新排队的文件）。卸载后不再认领新文件，在途 XHR 照常传完
+   *  （abort 会把切 Tab 误当成失败），迟到的 patch 由 mounted 短路丢弃。 */
   async function pump() {
     if (pumping.current) return
     pumping.current = true
     onUploadBusyChange?.(true)
     try {
-      while (true) {
-        const next = uploadsRef.current.find((i) => i.status === 'queued')
-        if (next === undefined) break
-        patchUpload(next.key, { status: 'uploading', progress: 0, reason: null })
-        try {
-          const r = await api.uploadDataset(ensureSessionName(), [next.file], (pct) => {
-            patchUpload(next.key, { progress: pct })
-          })
-          if (!mounted.current) return
-          if (r.added.length > 0) {
-            patchUpload(next.key, { status: 'done', progress: 100 })
-            onUploaded(r) // 回填 dataset_dir（同路径重复回填幂等）
-            void refresh() // 供分离确认面板读取文件数/时长（失败只走 loadError，不算上传失败）
-          } else {
-            patchUpload(next.key, {
-              status: 'skipped',
-              reason: r.skipped[0]?.reason ?? '服务器拒收',
+      await pumpPool({
+        concurrency: UPLOAD_CONCURRENCY,
+        takeNext: () => {
+          // 卸载即停止认领：不让后台把剩余队列悄悄传完（与原串行泵同一语义）
+          if (!mounted.current) return null
+          return uploadsRef.current.find((i) => i.status === 'queued') ?? null
+        },
+        begin: (item) =>
+          patchUpload(item.key, { status: 'uploading', progress: 0, reason: null }),
+        process: async (item) => {
+          try {
+            const r = await api.uploadDataset(ensureSessionName(), [item.file], (pct) => {
+              patchUpload(item.key, { progress: pct })
             })
+            if (!mounted.current) return
+            if (r.added.length > 0) {
+              patchUpload(item.key, { status: 'done', progress: 100 })
+              onUploaded(r) // 回填 dataset_dir（同路径重复回填幂等）
+              void refresh() // 供分离确认面板读取文件数/时长（失败只走 loadError，不算上传失败）
+            } else {
+              patchUpload(item.key, {
+                status: 'skipped',
+                reason: r.skipped[0]?.reason ?? '服务器拒收',
+              })
+            }
+          } catch (e) {
+            if (!mounted.current) return
+            // 保留 failed 行 + 重试入口：网络闪断/超限都不丢用户已选的文件
+            patchUpload(item.key, { status: 'failed', reason: errorMessage(e) })
           }
-        } catch (e) {
-          if (!mounted.current) return
-          // 保留 failed 行 + 重试入口：网络闪断/超限都不丢用户已选的文件
-          patchUpload(next.key, { status: 'failed', reason: errorMessage(e) })
-        }
-      }
+        },
+      })
     } finally {
       pumping.current = false
       onUploadBusyChange?.(false)
@@ -393,41 +409,50 @@ export function DatasetPicker({
 
   return (
     <div className="flex flex-col gap-3">
-      {/* 上传区：拖拽/多选即传，目标目录自动创建（随机编号），无需命名 */}
-      <div className="flex flex-col gap-2.5 rounded-lg border border-dashed p-3">
-        <div
-          onDragEnter={(e) => {
+      {/* 上传区：点击虚线框任意位置选文件 / 拖拽即传（整框都是热区），目标目录自动
+          创建（随机编号），无需命名 */}
+      <div
+        role="button"
+        tabIndex={0}
+        aria-label="上传参考音频：点击选择或直接拖拽音频文件"
+        onClick={() => fileInput.current?.click()}
+        onKeyDown={(e) => {
+          // role=button 的键盘可达义务：Enter / 空格等效点击
+          if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault()
-            setDragOver(true)
-          }}
-          onDragOver={(e) => e.preventDefault()}
-          onDragLeave={(e) => {
-            // 拖进子元素也会触发 dragleave：还留在拖拽区内就不熄灭高亮
-            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false)
-          }}
-          onDrop={onDrop}
-          className={`flex flex-wrap items-center justify-center gap-2 rounded-lg p-4 text-center transition-colors ${
-            dragOver ? 'border-border bg-muted' : ''
-          }`}
-        >
+            fileInput.current?.click()
+          }
+        }}
+        onDragEnter={(e) => {
+          e.preventDefault()
+          setDragOver(true)
+        }}
+        onDragOver={(e) => e.preventDefault()}
+        onDragLeave={(e) => {
+          // 拖进子元素也会触发 dragleave：还留在拖拽区内就不熄灭高亮
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false)
+        }}
+        onDrop={onDrop}
+        className={`flex cursor-pointer select-none flex-col items-center gap-2 rounded-lg border border-dashed p-4 text-center outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 ${
+          dragOver ? 'border-border bg-muted' : 'hover:bg-muted/40'
+        }`}
+      >
+        <div className="flex flex-wrap items-center justify-center gap-2">
           <UploadIcon className="size-4 text-muted-foreground" />
-          <span className="text-sm text-muted-foreground">拖拽音频文件到此处，或</span>
-          <Button variant="outline" size="sm" onClick={() => fileInput.current?.click()}>
-            选择文件
-          </Button>
-          {/* 隐藏的真实 input：accept 与后端 AUDIO_SUFFIXES 同源（domain.ts） */}
-          <input
-            ref={fileInput}
-            type="file"
-            multiple
-            accept={AUDIO_SUFFIXES.join(',')}
-            onChange={onPick}
-            className="hidden"
-          />
+          <span className="text-sm text-muted-foreground">拖拽音频文件到此处，或点击选择文件</span>
         </div>
         <p className="text-xs text-muted-foreground">
           支持 {AUDIO_SUFFIXES.join(' / ')}，可多选；单个文件 ≤ 500 MB
         </p>
+        {/* 隐藏的真实 input：accept 与后端 AUDIO_SUFFIXES 同源（domain.ts） */}
+        <input
+          ref={fileInput}
+          type="file"
+          multiple
+          accept={AUDIO_SUFFIXES.join(',')}
+          onChange={onPick}
+          className="hidden"
+        />
       </div>
 
       {/* 上传会话预览列表：逐文件状态（排队 / 进度 / 完成 / 跳过原因 / 失败重试） */}
