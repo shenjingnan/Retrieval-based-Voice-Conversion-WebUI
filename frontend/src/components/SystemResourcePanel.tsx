@@ -42,24 +42,31 @@ function ResourceRow({
   )
 }
 
-/** GPU 逐卡一行（多卡时标签带序号）；util 为 null（WDDM 等不支持）只降级该字段文案，
- *  显存数据照常展示——对训练来说显存比利用率更有参考价值（batch size 自适应按显存） */
+/** GPU 逐卡一行（多卡时标签带序号）。进度条画显存占用率、与右侧显存数值同口径：
+ *  利用率在训练批次间隙会掉到个位数，绑条会让「显存 11/12 GiB」配上一根 3% 的条，
+ *  看起来像算错了（batch size 自适应也是按显存而非利用率）；util 为 null（WDDM 等
+ *  不支持）只降级该字段文案，显存数据照常展示 */
 function GpuRows({ gpus }: { gpus: GpuStats[] }) {
   const multi = gpus.length > 1
   return (
     <>
       {gpus.map((g) => {
-        const util = g.utilization_percent === null ? '利用率不可用' : `${g.utilization_percent}%`
+        const util =
+          g.utilization_percent === null ? '利用率不可用' : `利用率 ${g.utilization_percent}%`
         const memory =
           g.memory_used_bytes === null || g.memory_total_bytes === null
             ? null
             : `显存 ${formatGib(g.memory_used_bytes)} / ${formatGib(g.memory_total_bytes)} GiB`
+        const memoryPercent =
+          g.memory_used_bytes === null || g.memory_total_bytes === null
+            ? null
+            : (g.memory_used_bytes / g.memory_total_bytes) * 100
         return (
           <ResourceRow
             key={g.index}
             label={multi ? `GPU ${g.index} · ${g.name}` : `GPU · ${g.name}`}
             value={memory === null ? util : `${util} · ${memory}`}
-            percent={g.utilization_percent}
+            percent={memoryPercent}
           />
         )
       })}
