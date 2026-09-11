@@ -1,16 +1,24 @@
 /**
- * 模型管理页（P2）：assets/weights 的模型卡片列表。
- * 卡片操作：去推理（跨 Tab 联动选中）、下载（一键 zip 打包 pth + 配对索引，浏览器原生下载）、
- * 补训索引（实验名默认由模型名推导，可编辑）、
+ * 模型管理页（P2）：assets/weights 的模型卡片列表，按实验名聚合——一次训练的
+ * 最终模型是组代表项，save_every_weights 存下的中间轮次收进「中间轮次模型（N）」
+ * 折叠子列表（groupModels 分组，见 lib/domain）。
+ * 代表项操作：去推理（跨 Tab 联动选中）、下载（一键 zip 打包 pth + 配对索引）、
+ * 补训索引（实验名默认由模型名推导，可编辑；同组共享一个索引，故为组级操作）、
  * 删除（两段式确认；后端会联动删除会配对到它的索引）。
+ * 中间轮次子项操作：去推理 / 下载 / 删除，与代表项同款（补训索引除外）。
  * 补训索引走 POST /api/train/index + useTask 显示进度与结果。
  */
-import { useEffect, useRef, useState, type ChangeEvent } from 'react'
-import { DownloadIcon, LoaderCircleIcon, RefreshCwIcon } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
+import {
+  ChevronDownIcon,
+  DownloadIcon,
+  LoaderCircleIcon,
+  RefreshCwIcon,
+} from 'lucide-react'
 
 import { api, type ModelVersion, type RvcModel } from '@/api/client'
 import { useTask } from '@/hooks/useTask'
-import { EXP_NAME_RE, experimentName } from '@/lib/domain'
+import { EXP_NAME_RE, experimentName, groupModels, parseEpochSuffix } from '@/lib/domain'
 import { errorMessage } from '@/lib/utils'
 import { ErrorDetail } from '@/components/ErrorDetail'
 import { Button } from '@/components/ui/button'
@@ -21,6 +29,11 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -30,16 +43,19 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 
-/** 补训索引的内联表单：实验名可编辑（默认由模型名推导），版本默认 v2 可改 */
+/**
+ * 补训索引的内联表单：实验名可编辑（默认由模型名推导），版本默认 v2 可改。
+ * groupKey 是所属组的键（Models 页以组为卡片单位），不再指向单个模型文件
+ */
 interface IndexFormState {
-  model: string
+  groupKey: string
   expName: string
   version: ModelVersion
 }
 
-/** 正在监视的补训索引任务（挂在对应模型卡片下） */
+/** 正在监视的补训索引任务（挂在对应组的卡片下） */
 interface WatchedIndexTask {
-  model: string
+  groupKey: string
   taskId: string
 }
 
@@ -142,7 +158,8 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
         indexCount: result.deleted_indices.length,
         failedCount: result.failed_indices.length,
       })
-      if (indexForm?.model === name) setIndexForm(null) // 卡片将消失，顺带收起表单
+      // 表单/监视区按组键渲染（indexForm.groupKey === g.key），删单个成员组还在，
+      // 不主动收起；整组删光后渲染条件自然不成立，残留状态无害（下次打开会覆盖）
       setReloadTick((t) => t + 1)
     } catch (e) {
       if (mounted.current) setDeleteError(errorMessage(e))
@@ -175,7 +192,7 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
         version: indexForm.version,
       })
       if (!mounted.current) return
-      setWatched({ model: indexForm.model, taskId: created.task_id })
+      setWatched({ groupKey: indexForm.groupKey, taskId: created.task_id })
       setIndexForm(null) // 任务已受理，收起表单（进度见下方监视区）
     } catch (e) {
       if (mounted.current) setSubmitError(errorMessage(e))
@@ -197,6 +214,11 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
   const running = watched !== null && !task.terminal
   const progressPct = task.progress === null ? null : Math.round(task.progress * 100)
   const taskFailed = task.terminal && task.status !== 'success'
+  // 平铺列表 → 按实验名聚合（最终模型 + 中间轮次折进同组），展示层分组见 groupModels
+  const groups = useMemo(
+    () => (models === null ? [] : groupModels(models)),
+    [models],
+  )
   // 补训索引实验名客户端校验（与 Training 页同款：EXP_NAME_RE + 拒 "." / ".."，
   // 后端 _check_exp_name 会再校验一次）
   const expNameValid =
@@ -212,7 +234,8 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
           <div className="flex flex-col gap-1.5">
             <CardTitle>模型管理</CardTitle>
             <CardDescription>
-              查看 assets/weights 中的音色模型，删除或补建检索索引。
+              查看 assets/weights 中的音色模型，删除或补建检索索引；同一次训练的
+              中间轮次产物收进各组卡片下方的折叠列表。
             </CardDescription>
           </div>
           <Button
@@ -264,25 +287,34 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
           </p>
         )}
 
-        {(models ?? []).map((m) => {
-          const exp = experimentName(m.name.replace(/\.pth$/i, ''))
+        {groups.map((g) => {
+          const rep = g.representative
+          const exp = experimentName(rep.name.replace(/\.pth$/i, ''))
           // 退化文件名（如 _e20_s100.pth）剥不出实验名，补训索引无从谈起
           const canReindex = exp.length > 0
-          // 该卡片的补训索引任务进行中：删除会让正在建立索引的实验失去主体，先禁用
-          const reindexingThisCard = watched !== null && watched.model === m.name && running
+          // 训练未完成（只有中间轮次）或最终模型被单独删除：代表项退化为最大轮次的中间产物
+          const noFinal = g.final === null && g.intermediates.length > 0
+          // 该组补训索引任务进行中：删除任何成员都会让正在建立索引的实验失去主体，全组先禁用
+          const reindexingThisGroup =
+            watched !== null && watched.groupKey === g.key && running
           return (
-            <div key={m.name} className="flex flex-col gap-3 rounded-lg border p-4">
+            <div key={g.key} className="flex flex-col gap-3 rounded-lg border p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex min-w-0 flex-col gap-0.5">
-                  <span className="truncate font-mono text-sm font-medium" title={m.name}>
-                    {m.name}
+                  <span className="truncate font-mono text-sm font-medium" title={rep.name}>
+                    {rep.name}
                   </span>
-                  {m.index !== null ? (
+                  {noFinal && (
+                    <span className="text-xs text-amber-600 dark:text-amber-400">
+                      尚无最终产物（训练未完成或已被删除），当前为轮次最大的中间模型
+                    </span>
+                  )}
+                  {rep.index !== null ? (
                     <span
                       className="truncate text-xs text-muted-foreground"
-                      title={m.index}
+                      title={rep.index}
                     >
-                      索引：{fileName(m.index)}
+                      索引：{fileName(rep.index)}
                     </span>
                   ) : (
                     <span className="text-xs text-amber-600 dark:text-amber-400">
@@ -291,7 +323,7 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                   )}
                 </div>
                 <div className="flex items-center gap-2">
-                  <Button size="sm" variant="outline" onClick={() => onGoInfer(m.name)}>
+                  <Button size="sm" variant="outline" onClick={() => onGoInfer(rep.name)}>
                     去推理
                   </Button>
                   {/* 下载：a 标签原生下载（服务端 Content-Disposition 定名），
@@ -299,19 +331,19 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                   <Button
                     size="sm"
                     variant="outline"
-                    render={<a href={api.modelDownloadUrl(m.name)} />}
+                    render={<a href={api.modelDownloadUrl(rep.name)} />}
                     title="下载模型包（zip，含 pth 与配对索引）"
                   >
                     <DownloadIcon />
                     下载
                   </Button>
-                  {m.index === null && canReindex && (
+                  {rep.index === null && canReindex && (
                     <Button
                       size="sm"
                       variant="outline"
                       disabled={running}
                       onClick={() =>
-                        setIndexForm({ model: m.name, expName: exp, version: 'v2' })
+                        setIndexForm({ groupKey: g.key, expName: exp, version: 'v2' })
                       }
                     >
                       补训索引
@@ -320,31 +352,32 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                   <Button
                     size="sm"
                     variant="destructive"
-                    disabled={deleting !== null || reindexingThisCard}
-                    onClick={() => onDeleteClick(m.name)}
+                    disabled={deleting !== null || reindexingThisGroup}
+                    onClick={() => onDeleteClick(rep.name)}
                     title={
-                      reindexingThisCard ? '该模型正在补训索引，任务结束后再删除' : undefined
+                      reindexingThisGroup ? '该实验正在补训索引，任务结束后再删除' : undefined
                     }
                   >
-                    {deleting === m.name && <LoaderCircleIcon className="animate-spin" />}
-                    {confirmDelete === m.name ? '确认删除？' : '删除'}
+                    {deleting === rep.name && <LoaderCircleIcon className="animate-spin" />}
+                    {confirmDelete === rep.name ? '确认删除？' : '删除'}
                   </Button>
                 </div>
               </div>
 
               {/* 两段式确认的说明：删除会连带配对规则命中的全部索引（后端联动），
                   同源模型可能共用同一索引，影响范围可能大于当前显示的配对，必须让用户知情 */}
-              {confirmDelete === m.name && (
+              {confirmDelete === rep.name && (
                 <p className="text-xs text-amber-600 dark:text-amber-400">
                   将删除该模型，及其按配对规则命中的全部索引
-                  {m.index !== null ? `（当前配对：${fileName(m.index)}）` : '（当前无配对索引）'}
+                  {rep.index !== null ? `（当前配对：${fileName(rep.index)}）` : '（当前无配对索引）'}
                   ；同源模型可能共用同一索引，删除后它们也会失去索引。再次点击按钮确认，3
                   秒后自动取消。
                 </p>
               )}
 
-              {/* 补训索引内联表单：实验名默认推导、可编辑；版本默认 v2 可改 */}
-              {indexForm !== null && indexForm.model === m.name && (
+              {/* 补训索引内联表单：实验名默认推导、可编辑；版本默认 v2 可改（组级操作：
+                  同组模型共享同一索引，这里建/补一次即可，中间轮次子项不再各放一份） */}
+              {indexForm !== null && indexForm.groupKey === g.key && (
                 <div className="flex flex-col gap-2 rounded-lg bg-muted/50 p-3">
                   <span className="text-sm font-medium">补训索引</span>
                   <p className="text-xs text-muted-foreground">
@@ -425,7 +458,7 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
               )}
 
               {/* 补训索引任务监视区（进度 + 结果） */}
-              {watched !== null && watched.model === m.name && (
+              {watched !== null && watched.groupKey === g.key && (
                 <div className="flex flex-col gap-2 rounded-lg border p-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
@@ -486,6 +519,86 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                     </ErrorDetail>
                   )}
                 </div>
+              )}
+
+              {/* 中间轮次折叠子列表：默认收起，epoch 升序（训练演进顺序）。
+                  子项与代表项同款操作（去推理/下载/删除）；补训索引是组级操作
+                  （同组共享一个索引），不重复出现。文件名剥不出轮次时原样展示 */}
+              {g.intermediates.length > 0 && (
+                <Collapsible>
+                  <CollapsibleTrigger className="flex items-center gap-1 self-start rounded-lg px-2 py-1.5 text-sm text-muted-foreground select-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none [&_svg]:transition-transform [&[aria-expanded=true]_svg]:rotate-180">
+                    中间轮次模型（{g.intermediates.length}）
+                    <ChevronDownIcon className="size-4" />
+                  </CollapsibleTrigger>
+                  <CollapsibleContent>
+                    <div className="flex flex-col divide-y pt-1">
+                      {g.intermediates.map((m) => {
+                        const epoch = parseEpochSuffix(m.name.replace(/\.pth$/i, ''))
+                        return (
+                          <div
+                            key={m.name}
+                            className="flex flex-wrap items-center justify-between gap-2 py-2"
+                          >
+                            <span
+                              className="truncate font-mono text-xs"
+                              title={m.name}
+                            >
+                              {epoch === null
+                                ? m.name
+                                : `第 ${epoch.epoch} 轮 · step ${epoch.step}`}
+                            </span>
+                            <div className="flex items-center gap-2">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => onGoInfer(m.name)}
+                              >
+                                去推理
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                render={<a href={api.modelDownloadUrl(m.name)} />}
+                                title="下载模型包（zip，含 pth 与配对索引）"
+                              >
+                                <DownloadIcon />
+                                下载
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="destructive"
+                                disabled={deleting !== null || reindexingThisGroup}
+                                onClick={() => onDeleteClick(m.name)}
+                                title={
+                                  reindexingThisGroup
+                                    ? '该实验正在补训索引，任务结束后再删除'
+                                    : undefined
+                                }
+                              >
+                                {deleting === m.name && (
+                                  <LoaderCircleIcon className="animate-spin" />
+                                )}
+                                {confirmDelete === m.name ? '确认删除？' : '删除'}
+                              </Button>
+                            </div>
+                            {/* 子项的两段式确认说明：索引是全组共用的，删任何成员
+                                都会联动删掉它，其余轮次随之失去索引，必须让用户知情 */}
+                            {confirmDelete === m.name && (
+                              <p className="w-full text-xs text-amber-600 dark:text-amber-400">
+                                将删除该中间模型，及其按配对规则命中的全部索引
+                                {m.index !== null
+                                  ? `（当前配对：${fileName(m.index)}）`
+                                  : '（当前无配对索引）'}
+                                ；本组模型共用该索引，删除后其余轮次也会失去索引。再次点击按钮确认，3
+                                秒后自动取消。
+                              </p>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </CollapsibleContent>
+                </Collapsible>
               )}
             </div>
           )
