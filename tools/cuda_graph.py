@@ -11,6 +11,12 @@ logger = logging.getLogger(__name__)
 
 ENV_NAME = "RVC_CUDA_GRAPH"
 MAX_CACHE_ENV = "RVC_CUDA_GRAPH_MAX_CACHE"
+MAX_FRAMES_ENV = "RVC_CUDA_GRAPH_MAX_FRAMES"
+# enc_p 自注意力显存随帧数平方增长：~7500 帧（约 37 秒）的段，一张图的私有池就有
+# ~2.5 GiB（2026-09-11 在 12 GiB 的 RTX 3060 上 OOM 复盘）。超过该帧数上限的片段
+# 直接走 eager——长片段是单次推理的内存大头，图加速的收益占比反而最小。实时变声
+# 的固定短块（~2.4 秒 ≈ 480 帧）远低于上限，不受影响。0 或负数 = 不设上限。
+DEFAULT_MAX_CAPTURE_FRAMES = 3000  # ≈15 秒 @200 帧/秒（16 kHz ÷ 160 窗 × 2 上采样）
 _probe_lock = threading.Lock()
 _probe_result = None
 
@@ -97,6 +103,28 @@ def cuda_graph_enabled(device):
     )
 
 
+def max_capture_frames():
+    raw = os.environ.get(MAX_FRAMES_ENV)
+    if raw is None:
+        return DEFAULT_MAX_CAPTURE_FRAMES
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", MAX_FRAMES_ENV, raw, DEFAULT_MAX_CAPTURE_FRAMES)
+        return DEFAULT_MAX_CAPTURE_FRAMES
+
+
+def cuda_graph_applies(device, first_input):
+    """run_cuda_graph 的启用判定单点（pipeline 也据此决定事后是否 empty_cache）：
+    未启用，或首输入的序列长度超过捕获上限 → False（该次推理走 eager）。"""
+    if not cuda_graph_enabled(device):
+        return False
+    if not torch.is_tensor(first_input) or first_input.dim() < 2:
+        return False
+    limit = max_capture_frames()
+    return not (limit > 0 and first_input.shape[1] > limit)
+
+
 def _tensor_signature(tensor):
     return (
         tuple(tensor.shape),
@@ -144,6 +172,24 @@ class _CapturedCall:
             return output
 
 
+def _default_cache_entries():
+    """按显存取缓存条数默认值：每条图的私有池都是 GiB 级，固定 8 条在 12 GiB 卡上
+    累积出 ~20 GiB 私有池（2026-09-11 事故成因之一）。RVC_CUDA_GRAPH_MAX_CACHE
+    显式设置时优先生效。"""
+    try:
+        total_gib = (
+            torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+            / (1 << 30)
+        )
+    except Exception:
+        return 4
+    if total_gib <= 6:
+        return 2
+    if total_gib <= 13:
+        return 3
+    return 8
+
+
 class _GraphCache:
     def __init__(self):
         self.entries = OrderedDict()
@@ -155,6 +201,56 @@ class _GraphCache:
         self.eviction_count = 0
         self.capture_ms = 0.0
 
+    def _cache_limit(self):
+        fallback = _default_cache_entries()
+        try:
+            limit = int(os.environ.get(MAX_CACHE_ENV, fallback))
+        except ValueError:
+            limit = fallback
+        return max(1, limit)
+
+    def _trim(self):
+        while len(self.entries) > self._cache_limit():
+            self.entries.popitem(last=False)
+            self.eviction_count += 1
+
+    def _evict_all(self):
+        """逐出全部图池。私有池显存只有在条目引用消失并 empty_cache 后才回到驱动
+        （GC 不会自动归还，见 server/api/infer.py._dispose_vc 的同款注释）。"""
+        self.eviction_count += len(self.entries)
+        self.entries.clear()
+
+    def _capture_entry(self, key, signature, function, inputs):
+        """捕获一条图，成功返回条目、失败返回 None。捕获 OOM 时先逐出全部旧图池并
+        把缓存分配器空闲块还给驱动再重试一次——旧池驻留时连 eager 回退都会一起 OOM，
+        只拉黑形状的话重试同形状将无限 OOM（2026-09-11 事故复盘）；两次仍 OOM 或其他
+        异常则拉黑该形状转永久 eager。"""
+        for attempt in (1, 2):
+            try:
+                entry = _CapturedCall(function, inputs)
+            except torch.OutOfMemoryError:
+                if attempt == 2:
+                    logger.exception("CUDA Graph capture OOM twice for %s; using eager", key)
+                    self.failures.add(signature)
+                    return None
+                logger.warning(
+                    "CUDA Graph capture OOM for %s; evicting %d pool(s) and retrying",
+                    key,
+                    len(self.entries),
+                )
+                self._evict_all()
+                torch.cuda.empty_cache()
+            except Exception:
+                logger.exception("CUDA Graph capture failed for %s; using eager", key)
+                self.failures.add(signature)
+                return None
+            else:
+                self.entries[signature] = entry
+                self.capture_count += 1
+                self.capture_ms += entry.capture_ms
+                self._trim()
+                return entry
+
     def run(self, key, function, inputs):
         signature = key + tuple(_tensor_signature(value) for value in inputs)
         with self.lock:
@@ -163,19 +259,9 @@ class _GraphCache:
                 return function(*inputs)
             entry = self.entries.get(signature)
             if entry is None:
-                try:
-                    entry = _CapturedCall(function, inputs)
-                    self.entries[signature] = entry
-                    self.capture_count += 1
-                    self.capture_ms += entry.capture_ms
-                    max_entries = max(1, int(os.environ.get(MAX_CACHE_ENV, "8")))
-                    while len(self.entries) > max_entries:
-                        self.entries.popitem(last=False)
-                        self.eviction_count += 1
-                except Exception:
-                    self.failures.add(signature)
+                entry = self._capture_entry(key, signature, function, inputs)
+                if entry is None:
                     self.fallback_count += 1
-                    logger.exception("CUDA Graph capture failed for %s; using eager", key)
                     return function(*inputs)
             else:
                 self.entries.move_to_end(signature)
@@ -186,7 +272,7 @@ class _GraphCache:
 
 
 def run_cuda_graph(owner, namespace, function, *inputs):
-    if not inputs or not cuda_graph_enabled(inputs[0].device):
+    if not inputs or not cuda_graph_applies(inputs[0].device, inputs[0]):
         return function(*inputs)
     cache = getattr(owner, "_rvc_cuda_graph_cache", None)
     if cache is None:

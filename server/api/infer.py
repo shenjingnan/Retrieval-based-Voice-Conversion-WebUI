@@ -73,6 +73,14 @@ class _CacheEntry:
 
 def _build_vc():
     """构造 VC 实例（测试 patch 点：隔离 torch 导入）。"""
+    # 与 webui.py:14-18 同源：编排型服务默认 eager（RVC_CUDA_GRAPH=0）。整文件推理的
+    # 片段长度各异，每种长度都会捕获一张 CUDA 图并冻结全套中间激活，图池按形状累积，
+    # 12 GiB 卡上实测堆到 ~20 GiB 私有池后 OOM（2026-09-11 复盘）；开图基准测试设
+    # RVC_OFFLINE_CUDA_GRAPH=1。用赋值而非 setdefault：训练流程可能先经 commands.py
+    # 导入 configs、触发 configure_cuda_graph 自动探测并写入 "1"，须在此纠正。
+    os.environ["RVC_CUDA_GRAPH"] = (
+        "1" if os.environ.get("RVC_OFFLINE_CUDA_GRAPH", "0") == "1" else "0"
+    )
     # 延迟导入：configs.config 在 import 期就探测计算设备，避免 pytest 收集期加载 torch
     from configs.config import Config
     from infer.vc.modules import VC
