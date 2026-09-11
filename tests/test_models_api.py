@@ -1,4 +1,6 @@
+import io
 import os
+import zipfile
 
 import pytest
 from fastapi.testclient import TestClient
@@ -317,3 +319,159 @@ def test_delete_model_ignores_spkid_index(monkeypatch, tmp_path):
     assert resp.status_code == 200
     assert resp.json()["deleted_indices"] == []
     assert spkid.exists()
+
+
+# ---------------------------------------------------------------------------
+# GET /api/models/{name}/download（zip 打包下载：pth + 配对索引）
+# ---------------------------------------------------------------------------
+
+
+def test_download_model_bundles_pth_and_index(monkeypatch, tmp_path):
+    """正常下载：zip 内含实验名目录下的 pth 与配对索引，字节与源文件一致。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    model = weights / "alice_v2_e20_s100.pth"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"pth-bytes")
+    index = _touch(indices / "added_IVFxxx_Flat_nprobe_1_alice_v2.index")
+    index.write_bytes(b"index-bytes")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", indices)
+
+    resp = TestClient(create_app()).get("/api/models/alice_v2_e20_s100.pth/download")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    assert resp.headers["content-disposition"] == 'attachment; filename="alice_v2_e20_s100.zip"'
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    assert zf.namelist() == [
+        "alice_v2/alice_v2_e20_s100.pth",
+        "alice_v2/added_IVFxxx_Flat_nprobe_1_alice_v2.index",
+    ]
+    assert zf.read("alice_v2/alice_v2_e20_s100.pth") == b"pth-bytes"
+    assert zf.read("alice_v2/added_IVFxxx_Flat_nprobe_1_alice_v2.index") == b"index-bytes"
+
+
+def test_download_model_without_index_only_pth(monkeypatch, tmp_path):
+    """缺索引的模型照常可下载，包内只有 pth，不被拦截。"""
+    weights = tmp_path / "weights"
+    _touch(weights / "bob.pth")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).get("/api/models/bob.pth/download")
+
+    assert resp.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    assert zf.namelist() == ["bob/bob.pth"]
+    assert zf.read("bob/bob.pth") == b"x"
+
+
+def test_download_model_degenerate_stem_falls_back_to_stem_dir(monkeypatch, tmp_path):
+    """退化文件名（_e20_s100.pth）剥不出实验名 → zip 目录退回模型 stem，不能是空目录名。"""
+    weights = tmp_path / "weights"
+    _touch(weights / "_e20_s100.pth")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).get("/api/models/_e20_s100.pth/download")
+
+    assert resp.status_code == 200
+    assert zipfile.ZipFile(io.BytesIO(resp.content)).namelist() == ["_e20_s100/_e20_s100.pth"]
+
+
+def test_download_model_multi_chunk_stream_stays_intact(monkeypatch, tmp_path):
+    """缓冲中途多次 flush 后 zip 仍必须完整：zipfile 在可 seek 的缓冲上写完数据会
+    回头 seek 改写 local header，已被 flush 出去的字节就再也改不到了（真实 55MB
+    模型端到端实测包损坏，单测里 1 字节假文件从不触发中途 flush 所以漏过）。
+    把块大小打到极小强制多次 flush，包必须仍过 zipfile 的 CRC 完整性校验。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    payload = bytes(range(256)) * 40  # 10KB，远超下方 64 字节的块大小
+    model = weights / "alice.pth"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(payload)
+    index = _touch(indices / "added_IVF1_Flat_nprobe_1_alice.index")
+    index.write_bytes(payload[::-1])
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", indices)
+    monkeypatch.setattr("server.api.models._ZIP_CHUNK", 64)
+
+    resp = TestClient(create_app()).get("/api/models/alice.pth/download")
+
+    assert resp.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    assert zf.testzip() is None
+    assert zf.read("alice/alice.pth") == payload
+    assert zf.read("alice/added_IVF1_Flat_nprobe_1_alice.index") == payload[::-1]
+
+
+def test_download_model_chinese_name_uses_rfc5987(monkeypatch, tmp_path):
+    """非 ASCII 模型名：filename= 放不下，必须走 filename*=utf-8''（RFC 5987），
+    否则非 latin-1 字节会把响应头打爆。"""
+    weights = tmp_path / "weights"
+    _touch(weights / "小明_v2.pth")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).get("/api/models/小明_v2.pth/download")
+
+    assert resp.status_code == 200
+    assert (
+        resp.headers["content-disposition"]
+        == "attachment; filename*=utf-8''%E5%B0%8F%E6%98%8E_v2.zip"
+    )
+    assert zipfile.ZipFile(io.BytesIO(resp.content)).namelist() == ["小明_v2/小明_v2.pth"]
+
+
+def test_download_model_missing(monkeypatch, tmp_path):
+    weights = tmp_path / "weights"
+    _touch(weights / "alice.pth")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).get("/api/models/carol.pth/download")
+
+    assert resp.status_code == 404
+
+
+@pytest.mark.parametrize("name", ["notes.txt", "readme", "alice.pth.bak"])
+def test_download_model_rejects_non_pth(monkeypatch, tmp_path, name):
+    """与 DELETE 同口径：只打包权重文件，weights 下的杂物不给下。"""
+    weights = tmp_path / "weights"
+    _touch(weights / name)
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).get(f"/api/models/{name}/download")
+
+    assert resp.status_code == 404
+
+
+@pytest.mark.parametrize("bad", ["%2E%2E", "%2E"])
+def test_download_model_rejects_traversal(monkeypatch, tmp_path, bad):
+    """防穿越：非 basename 一律 404（百分号编码直达 handler，同 DELETE 的理由）。"""
+    weights = tmp_path / "weights"
+    _touch(weights / "alice.pth")
+    outside = _touch(tmp_path / "outside.pth")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).get(f"/api/models/{bad}/download")
+
+    assert resp.status_code == 404
+    assert outside.exists() and (weights / "alice.pth").exists()
+
+
+@pytest.mark.parametrize("bad", ["../alice.pth", "sub/alice.pth"])
+def test_download_model_multi_segment_never_reaches_handler(monkeypatch, tmp_path, bad):
+    """带路径分隔符的形态匹配不上单段路由（防御在路由层），不能有任何文件被读走。"""
+    weights = tmp_path / "weights"
+    _touch(weights / "alice.pth")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).get(f"/api/models/{bad}/download")
+
+    assert resp.status_code in (404, 405)
+    assert (weights / "alice.pth").exists()

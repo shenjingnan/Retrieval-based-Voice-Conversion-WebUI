@@ -1,9 +1,14 @@
 """扫描 assets/weights 与 assets/indices，返回模型及其索引配对。"""
 import logging
 import re
+import zipfile
+from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from server import paths
 
@@ -13,6 +18,9 @@ router = APIRouter(prefix="/api")
 
 _EPOCH_SUFFIX = re.compile(r"_e\d+_s\d+$", re.IGNORECASE)
 _SPKID_SUFFIX = re.compile(r"_spkid\d+$", re.IGNORECASE)
+
+# zip 流的写出缓冲：每次攒满这么多字节才往响应里推一块，内存占用恒定
+_ZIP_CHUNK = 1024 * 1024
 
 
 def experiment_name(model_stem: str) -> str:
@@ -134,3 +142,82 @@ def delete_model(name: str):
         "deleted_indices": deleted_indices,
         "failed_indices": failed_indices,
     }
+
+
+def _zip_stream(entries: list[tuple[str, Path]]) -> Iterator[bytes]:
+    """把 entries 逐块流式打成 zip。ZIP_STORED 不压缩：pth/index 是二进制张量，
+    压缩率极低，白烧 CPU 还拖慢下载；攒一块吐一块让内存占用与文件大小无关，
+    不落临时文件也就没有清理问题。force_zip64 兜住超大文件（>4GB）的极端情况。
+
+    落给 zipfile 的是一个只有 write/tell、没有 seek 的 sink——这是关键：可 seek
+    的缓冲会让 zipfile 写完数据后回头 seek 改写 local header，而被中途 flush 出去
+    的字节再也改不到（真实大模型端到端实测包损坏）；缺 seek 则逼它走
+    data-descriptor 顺序写模式，全程只追加，天然适配流式响应。"""
+    out: deque[bytes] = deque()
+    written = 0
+
+    class _StreamSink:
+        def write(self, data: bytes) -> int:
+            nonlocal written
+            out.append(data)
+            written += len(data)
+            return len(data)
+
+        def tell(self) -> int:
+            return written
+
+        def flush(self) -> None:
+            pass
+        # 故意不提供 seek：见 docstring
+
+    with zipfile.ZipFile(_StreamSink(), "w", compression=zipfile.ZIP_STORED) as zf:
+        for arcname, src in entries:
+            with zf.open(arcname, "w", force_zip64=True) as dst, src.open("rb") as f:
+                while chunk := f.read(_ZIP_CHUNK):
+                    dst.write(chunk)
+                    while out:
+                        yield out.popleft()
+    while out:
+        yield out.popleft()
+
+
+def _content_disposition(download_name: str) -> str:
+    """Content-Disposition：ASCII 名走 filename=，否则 filename*=utf-8''（RFC 5987），
+    与 Starlette FileResponse 同一套分支——非 latin-1 字节进 filename= 会打爆响应头。"""
+    quoted = quote(download_name)
+    if quoted == download_name:
+        return f'attachment; filename="{download_name}"'
+    return f"attachment; filename*=utf-8''{quoted}"
+
+
+@router.get("/models/{name}/download")
+def download_model(name: str):
+    """一键打包下载：pth + 配对索引打成一个 zip 流式返回。
+
+    zip 是 Windows/macOS/Linux 三端原生可解压的格式，客户端无需任何处理；
+    包内一层实验名目录，解压后不散落当前文件夹。配对索引与列表页展示的
+    是同一个结果（_pick_index），看到的即所得；缺索引的模型包内只有 pth，
+    下载不被拦截。入口校验与 delete_model 同手法：非 basename / 非重量级
+    .pth / 不存在一律 404，绝不触达 weights 目录之外的路径。
+    """
+    if (
+        name in (".", "..")
+        or Path(name).name != name
+        or Path(name).suffix != ".pth"
+        or not (paths.WEIGHTS_DIR / name).is_file()
+    ):
+        raise HTTPException(404, f"模型不存在: {name}")
+    model_path = paths.WEIGHTS_DIR / name
+    stem = model_path.stem
+    exp = experiment_name(stem).lower()
+    index_path = _pick_index(exp, _list_indices())
+    # zip 内目录名：剥得出实验名用实验名，退化文件名退回模型 stem（不能是空目录名）
+    arc_dir = exp or stem
+    entries = [(f"{arc_dir}/{model_path.name}", model_path)]
+    if index_path is not None:
+        entries.append((f"{arc_dir}/{index_path.name}", index_path))
+    return StreamingResponse(
+        _zip_stream(entries),
+        media_type="application/zip",
+        headers={"Content-Disposition": _content_disposition(f"{stem}.zip")},
+    )
