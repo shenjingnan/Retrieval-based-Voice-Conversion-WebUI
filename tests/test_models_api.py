@@ -68,8 +68,9 @@ def test_models_ignore_dangling_symlink_index(monkeypatch, tmp_path):
     resp = client.get("/api/models")
 
     assert resp.status_code == 200
+    mtime = (weights / "alice_v2.pth").stat().st_mtime
     assert resp.json() == [{"name": "alice_v2.pth", "path": str(weights / "alice_v2.pth"),
-                            "index": str(linked)}]
+                            "index": str(linked), "mtime": int(mtime)}]
 
 
 def test_models_pair_edge_cases(monkeypatch, tmp_path):

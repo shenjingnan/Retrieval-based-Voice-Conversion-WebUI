@@ -91,6 +91,8 @@ def _scan():
                     "name": p.name,
                     "path": str(p),
                     "index": str(index) if index else None,
+                    # 文件修改时间（epoch 秒）：前端模型页按它把最近训练的组排前面
+                    "mtime": int(p.stat().st_mtime),
                 }
             )
     return models
