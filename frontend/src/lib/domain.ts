@@ -124,8 +124,10 @@ export function parseEpochSuffix(
  * {exp}_e{n}_s{n}.pth——折进同一个组。分组键与 experimentName 同口径（剥 _eX_sY
  * 后缀取实验名）；剥不出后缀的退化文件名（如裸的 _e20_s100.pth）用原始 stem
  * 自成一组且当最终产物，展示与平铺列表完全一致。命名不合规的手动模型同理。
+ * 组间按最近文件时间（latest）倒序——最近训练的排最前；mtime 同秒时按 key
+ * 字典序兜底，保证顺序稳定。组内仍按训练演进序（中间轮次 epoch 升序）。
  */
-export interface ModelGroup<T extends { name: string }> {
+export interface ModelGroup<T extends { name: string; mtime: number }> {
   /** 分组键：实验名；退化文件名时为原始 stem */
   key: string
   /** 最终产物 {exp}.pth；训练未完成（只有中间轮次）或已被单独删除时为 null */
@@ -134,9 +136,13 @@ export interface ModelGroup<T extends { name: string }> {
   intermediates: T[]
   /** 组卡片代表项：final ?? epoch 最大的中间产物（与 pickProductName 同口径） */
   representative: T
+  /** 组内所有产物中最新的文件修改时间（epoch 秒），组间倒序的排序键 */
+  latest: number
 }
 
-export function groupModels<T extends { name: string }>(models: T[]): ModelGroup<T>[] {
+export function groupModels<T extends { name: string; mtime: number }>(
+  models: T[],
+): ModelGroup<T>[] {
   const stemOf = (name: string): string => name.replace(/\.pth$/i, '')
   const groups = new Map<string, { final: T | null; intermediates: T[] }>()
   for (const m of models) {
@@ -159,13 +165,15 @@ export function groupModels<T extends { name: string }>(models: T[]): ModelGroup
   return [...groups.entries()]
     .map(([key, g]) => {
       const intermediates = [...g.intermediates].sort(byEpochStep)
+      const members = g.final === null ? intermediates : [g.final, ...intermediates]
       return {
         key,
         final: g.final,
         intermediates,
         // 组内至少有一个模型（final 或 intermediates 二者必有其一），不会越界
         representative: g.final ?? intermediates[intermediates.length - 1]!,
+        latest: Math.max(...members.map((m) => m.mtime)),
       }
     })
-    .sort((a, b) => a.key.localeCompare(b.key))
+    .sort((a, b) => b.latest - a.latest || a.key.localeCompare(b.key))
 }

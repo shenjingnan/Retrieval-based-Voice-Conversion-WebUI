@@ -2,6 +2,8 @@ export interface RvcModel {
   name: string
   path: string
   index: string | null
+  /** 文件修改时间（epoch 秒），模型页据此把最近训练的组排前面 */
+  mtime: number
 }
 
 /** server/tasks.py 的状态机（pending → running → success | failed | cancelled） */

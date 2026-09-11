@@ -1,7 +1,7 @@
 /**
  * 模型管理页（P2）：assets/weights 的模型卡片列表，按实验名聚合——一次训练的
  * 最终模型是组代表项，save_every_weights 存下的中间轮次收进「中间轮次模型（N）」
- * 折叠子列表（groupModels 分组，见 lib/domain）。
+ * 折叠子列表（groupModels 分组，见 lib/domain）；组卡片按最近训练时间倒序。
  * 代表项操作：去推理（跨 Tab 联动选中）、下载（一键 zip 打包 pth + 配对索引）、
  * 补训索引（实验名默认由模型名推导，可编辑；同组共享一个索引，故为组级操作）、
  * 删除（两段式确认；后端会联动删除会配对到它的索引）。
@@ -235,7 +235,7 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
             <CardTitle>模型管理</CardTitle>
             <CardDescription>
               查看 assets/weights 中的音色模型，删除或补建检索索引；同一次训练的
-              中间轮次产物收进各组卡片下方的折叠列表。
+              中间轮次产物收进各组卡片下方的折叠列表，最近训练的组排在最前。
             </CardDescription>
           </div>
           <Button
