@@ -109,3 +109,63 @@ export function pickProductName(models: Array<{ name: string }>, exp: string): s
   }
   return best?.name ?? null
 }
+
+/** 从训练产物 stem 解析 epoch/step（alice_v2_e20_s100 → {epoch:20, step:…}）；非该命名返回 null */
+export function parseEpochSuffix(
+  stem: string,
+): { epoch: number; step: number } | null {
+  const m = stem.match(/_e(\d+)_s(\d+)$/i)
+  return m === null ? null : { epoch: Number(m[1]), step: Number(m[2]) }
+}
+
+/**
+ * 模型列表按实验名聚合的分组视图（Models 页展示层专用，无 server 侧同源实现）：
+ * 一次训练的全部产物——最终模型 {exp}.pth 与 save_every_weights 存下的中间轮次
+ * {exp}_e{n}_s{n}.pth——折进同一个组。分组键与 experimentName 同口径（剥 _eX_sY
+ * 后缀取实验名）；剥不出后缀的退化文件名（如裸的 _e20_s100.pth）用原始 stem
+ * 自成一组且当最终产物，展示与平铺列表完全一致。命名不合规的手动模型同理。
+ */
+export interface ModelGroup<T extends { name: string }> {
+  /** 分组键：实验名；退化文件名时为原始 stem */
+  key: string
+  /** 最终产物 {exp}.pth；训练未完成（只有中间轮次）或已被单独删除时为 null */
+  final: T | null
+  /** 中间轮次产物，epoch 升序、同轮按 step 升序 */
+  intermediates: T[]
+  /** 组卡片代表项：final ?? epoch 最大的中间产物（与 pickProductName 同口径） */
+  representative: T
+}
+
+export function groupModels<T extends { name: string }>(models: T[]): ModelGroup<T>[] {
+  const stemOf = (name: string): string => name.replace(/\.pth$/i, '')
+  const groups = new Map<string, { final: T | null; intermediates: T[] }>()
+  for (const m of models) {
+    const stem = stemOf(m.name)
+    const exp = experimentName(stem)
+    const key = exp.length > 0 ? exp : stem
+    const entry = groups.get(key) ?? { final: null, intermediates: [] }
+    // 剥得动后缀（stem !== exp）= 中间轮次；剥不动 = 最终产物
+    if (stem === exp) entry.final = m
+    else entry.intermediates.push(m)
+    groups.set(key, entry)
+  }
+  const byEpochStep = (a: T, b: T): number => {
+    const pa = parseEpochSuffix(stemOf(a.name))
+    const pb = parseEpochSuffix(stemOf(b.name))
+    return (
+      (pa?.epoch ?? -1) - (pb?.epoch ?? -1) || (pa?.step ?? -1) - (pb?.step ?? -1)
+    )
+  }
+  return [...groups.entries()]
+    .map(([key, g]) => {
+      const intermediates = [...g.intermediates].sort(byEpochStep)
+      return {
+        key,
+        final: g.final,
+        intermediates,
+        // 组内至少有一个模型（final 或 intermediates 二者必有其一），不会越界
+        representative: g.final ?? intermediates[intermediates.length - 1]!,
+      }
+    })
+    .sort((a, b) => a.key.localeCompare(b.key))
+}
