@@ -856,6 +856,93 @@ def test_same_exp_conflict_applies_to_all_training_endpoints(stub, client, tmp_p
     }).status_code == 409
 
 
+# ---------------------------------------------------------------------------
+# 1.5 实验名存在性检查（自选实验名防冲突；只挂 pipeline，续训走 allow_existing）
+# ---------------------------------------------------------------------------
+
+
+def test_exp_name_exists_endpoint_reports_absent_dir(client):
+    resp = client.get("/api/train/exp-name/exists", params={"name": "mi-test"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"exists": False}
+
+
+def test_exp_name_exists_endpoint_reports_present_dir(client):
+    (paths.LOGS_DIR / "mi-test").mkdir(parents=True)
+
+    resp = client.get("/api/train/exp-name/exists", params={"name": "mi-test"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"exists": True}
+
+
+@pytest.mark.parametrize("exp_name", ["", "../evil", "a/b", "a b", "a$b", "a`b"])
+def test_exp_name_exists_endpoint_rejects_invalid_name(client, exp_name):
+    """非法名与提交接口同一张表（_check_exp_name）：前端输入时即时提示用。"""
+    resp = client.get("/api/train/exp-name/exists", params={"name": exp_name})
+
+    assert resp.status_code == 400
+    assert "实验名非法" in resp.json()["detail"]
+
+
+def test_pipeline_rejects_existing_exp_dir(stub, client, tmp_path):
+    """自选实验名撞上已有产物目录 → 409，不创建任务：防误覆盖与无意识续训。"""
+    (paths.LOGS_DIR / "mi-test").mkdir(parents=True)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+
+    resp = client.post(
+        "/api/train/pipeline", json={**FIT_BODY, "dataset_dir": str(dataset)}
+    )
+
+    assert resp.status_code == 409
+    assert "mi-test" in resp.json()["detail"]
+    assert stub.created == []
+
+
+def test_pipeline_allow_existing_permits_resume(stub, client, tmp_path):
+    """allow_existing=True 是显式续训意图（任务历史「重新提交」路径），同名目录放行。"""
+    (paths.LOGS_DIR / "mi-test").mkdir(parents=True)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+
+    resp = client.post(
+        "/api/train/pipeline",
+        json={**FIT_BODY, "dataset_dir": str(dataset), "allow_existing": True},
+    )
+
+    assert resp.status_code == 200
+    assert stub.created[0]["name"] == "pipeline"
+
+
+def test_exp_dir_existence_check_only_applies_to_pipeline(stub, client, tmp_path):
+    """存在性检查不外溢到分步端点：fit/preprocess/extract 操作已存在实验是续训语义，
+    Models 页「重建索引」也依赖已存在实验——它们的 409 只来自活动任务互斥。
+    （stub 会把上一请求创建的任务记为 running，断言间须清掉活动任务状态。）"""
+    (paths.LOGS_DIR / "mi-test").mkdir(parents=True)
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+
+    stub.snapshots.clear()
+    training._TASK_META.clear()
+    assert client.post("/api/train/preprocess", json={
+        "exp_name": "mi-test", "dataset_dir": str(dataset)
+    }).status_code == 200
+
+    stub.snapshots.clear()
+    training._TASK_META.clear()
+    assert client.post("/api/train/extract", json={"exp_name": "mi-test"}).status_code == 200
+
+    stub.snapshots.clear()
+    training._TASK_META.clear()
+    assert client.post("/api/train/fit", json=FIT_BODY).status_code == 200
+
+    stub.snapshots.clear()
+    training._TASK_META.clear()
+    assert client.post("/api/train/index", json={"exp_name": "mi-test"}).status_code == 200
+
+
 def test_real_manager_second_submission_queues_and_same_exp_conflicts(
     client, monkeypatch, tmp_path
 ):

@@ -62,6 +62,8 @@ export type TrainF0Method = 'rmvpe' | 'pm'
  * FitBody / PipelineBody 逐字段对齐；分步接口只取各自需要的子集。
  * n_p（进程数）不在其中：后端固定取 os.cpu_count()，前端没有调参入口。
  * batch_size 可选：省略（自动）时后端按设备自适应解析（webui 显存GB÷2，无卡为 1）。
+ * allow_existing 仅在 pipeline 生效（默认 false = 实验目录已存在则 409）；任务历史
+ * 「重新提交」显式传 true——失败任务的目录必然已存在，重提交是续训意图。
  */
 export interface TrainParams {
   exp_name: string
@@ -74,6 +76,7 @@ export interface TrainParams {
   save_every_epoch: number
   batch_size?: number
   save_every_weights: boolean
+  allow_existing?: boolean
 }
 
 /** 训练接口的统一返回体。已有任务运行中时新任务自动排队：queued=true 且
@@ -387,6 +390,15 @@ export const api = {
   trainDefaults: (): Promise<{ batch_size: number }> =>
     fetch('/api/train/defaults').then((r) => handle<{ batch_size: number }>(r)),
 
+  /**
+   * GET /api/train/exp-name/exists：实验名占用检查（输入框防抖查询用）。非法名后端
+   * 400——调用方须先做本地校验；检查失败（网络等）由调用方静默降级，提交时后端兜底。
+   */
+  trainExpNameExists: (name: string): Promise<{ exists: boolean }> =>
+    fetch(`/api/train/exp-name/exists?name=${encodeURIComponent(name)}`).then((r) =>
+      handle<{ exists: boolean }>(r),
+    ),
+
   // 注意 pipeline 不传 n_p：后端 PipelineBody 未声明该字段（内部固定 os.cpu_count()）
   trainPipeline: (p: TrainParams): Promise<TaskCreated> =>
     postJson('/api/train/pipeline', {
@@ -401,6 +413,7 @@ export const api = {
       // 自动（undefined）时键省略：后端按设备自适应解析并在任务日志里记来源
       ...(p.batch_size === undefined ? {} : { batch_size: p.batch_size }),
       save_every_weights: p.save_every_weights,
+      ...(p.allow_existing === undefined ? {} : { allow_existing: p.allow_existing }),
     }),
 
   getTasks: (): Promise<TaskSummary[]> =>

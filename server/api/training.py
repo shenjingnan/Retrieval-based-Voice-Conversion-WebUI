@@ -108,6 +108,9 @@ class IndexBody(BaseModel):
 class PipelineBody(FitBody):
     dataset_dir: str
     f0_method: str = "rmvpe"
+    # False（默认）＝新提交：实验目录已存在则 409（自选实验名防冲突）。True 仅由
+    # 任务历史「重新提交」携带：失败任务的目录必然已存在，重提交是显式续训意图
+    allow_existing: bool = False
 
 
 # 命令串按双引号包裹路径，这些字符会破坏参数边界（注入面），实验名额外拒绝空白字符；
@@ -503,6 +506,21 @@ def _ensure_exp_idle(exp_name: str) -> None:
             )
 
 
+def _ensure_exp_dir_free(exp_name: str, allow_existing: bool) -> None:
+    """自选实验名防冲突（只挂 pipeline 新提交）：logs/{exp} 目录已存在即 409——
+    防止误覆盖已有产物或无意识续进旧检查点。续训是显式动作（allow_existing=True，
+    任务历史「重新提交」专用），不走这条静默路径。与 _ensure_exp_idle 互补：
+    那里管「排队/运行中的活动任务」，这里管「磁盘上已有产物目录」。"""
+    if allow_existing:
+        return
+    if (paths.LOGS_DIR / exp_name).exists():
+        raise HTTPException(
+            409,
+            "实验名 %s 已存在，请换一个名字；要基于已有产物续训，请在任务历史中"
+            "使用「重新提交」" % exp_name,
+        )
+
+
 def _create(name: str, cmds: list, log_path: Path, *, setup=None, meta: dict | None = None,
             definition: dict | None = None):
     """登记任务并返回 {task_id, queued, queue_position}。
@@ -623,6 +641,15 @@ def train_defaults():
     return {"batch_size": resolve_default_batch_size()}
 
 
+@router.get("/train/exp-name/exists")
+def exp_name_exists(name: str):
+    """实验名占用检查（前端输入框防抖查询用）。非法名与提交接口同一张校验表
+    （_check_exp_name，文案一致，前端可直接透出）；合法名返回 logs/{name} 目录
+    是否已存在。纯只读：不创建目录、不登记任务。"""
+    _check_exp_name(name)
+    return {"exists": (paths.LOGS_DIR / name).exists()}
+
+
 @router.post("/train/index")
 def start_index(body: IndexBody):
     exp_name = _check_exp_name(body.exp_name)
@@ -657,6 +684,7 @@ def start_pipeline(body: PipelineBody):
     batch_size, batch_note = _resolve_batch_size(body.batch_size)
     n_p = os.cpu_count()
     exp_dir = paths.LOGS_DIR / exp_name
+    _ensure_exp_dir_free(exp_name, body.allow_existing)
 
     cmds = [build_preprocess_cmd(dataset_dir, SR_DICT[sr], n_p, exp_name, NOPARALLEL, PREPROCESS_PER)]
     cmds.append(build_precheck_cmd(exp_name))
