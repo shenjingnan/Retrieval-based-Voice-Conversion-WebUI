@@ -1,5 +1,7 @@
 """推理编排：缓存 VC 实例，透传参数给 infer.vc.modules.VC.vc_single。"""
+import gc
 import os
+import sys
 import tempfile
 import threading
 import uuid
@@ -14,8 +16,51 @@ from server import paths
 router = APIRouter(prefix="/api")
 
 _vc_lock = threading.Lock()
-# 缓存无上限的取舍：真做上限需 clear_cuda_graph_cache + empty_cache 的显存清理链路，P1 不做
+# 缓存上限（LRU）：每个 entry 驻留一整套 VC（HuBERT + 生成器 + checkpoint + Pipeline，
+# 合计 GB 级），而 torch 的 CPU/GPU 缓存分配器只增不减——无上限时一次「逐个试听多个
+# 模型」的会话就能把服务进程吃掉几十 GB 提交内存，挤死同进程编排的训练子进程
+# （Windows 上表现为「页面文件太小，无法完成操作」）。取 2：单用户「对比两三个音色」
+# 的常见来回切换不受影响（tests/test_infer_api.py 的 a→b→a 用例依赖 ≥2）。
+_VC_CACHE_MAX = 2
 _vc_cache: dict = {}
+
+
+def _dispose_vc(vc) -> None:
+    """释放单个 VC 携带的显存清理链路（CUDA 图缓存挂在其模型属性上，见
+    tools/cuda_graph.run_cuda_graph 的 owner 形参；GC 不会自动归还图私有内存池，
+    必须显式 clear）。只做图缓存清理与引用声明，不原地改写模型属性——可能存在
+    并发进行中的 vc_single（推理在 _vc_lock 外执行），原地置 None 会打断它；
+    缓存条目移除后，VC 对象随引用消失由 GC 回收。"""
+    graph_mod = sys.modules.get("tools.cuda_graph")
+    if graph_mod is None:
+        return  # torch 栈从未加载（测试替身 / 纯编排进程）：无图可清
+    for value in list(vars(vc).values()):
+        graph_mod.clear_cuda_graph_cache(value)
+
+
+def _reclaim_torch_memory() -> None:
+    """逐出后把 torch 缓存分配器持有的空闲块还给系统。sys.modules 门卫：torch 未
+    加载（测试）时是 no-op——本模块顶层不得引入 torch（pytest 收集期纪律）。"""
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_available():
+        return
+    gc.collect()  # 先让被逐出的 VC 真正变成不可达，empty_cache 才有块可还
+    torch.cuda.empty_cache()
+
+
+def release_all_vc() -> str | None:
+    """清空全部推理缓存并归还显存（任务启动前的内存让路，server/tasks 的 on_start
+    钩子调用）。串行队列保证此刻没有训练在跑；正在进行的单次推理持有 VC 的局部
+    引用，不受清空影响，跑完自然释放。返回写进任务日志的摘要行，无可释放时 None。"""
+    with _vc_lock:
+        if not _vc_cache:
+            return None
+        entries = list(_vc_cache.values())
+        _vc_cache.clear()
+    for entry in entries:
+        _dispose_vc(entry.vc)
+    _reclaim_torch_memory()
+    return "已释放推理模型缓存：%d 个（含 HuBERT/生成器/CUDA 图），为子进程腾出内存" % len(entries)
 
 
 class _CacheEntry:
@@ -36,9 +81,12 @@ def _build_vc():
 
 
 def get_vc_cached(name: str):
-    """缓存 VC 实例并记录已加载的权重名，命中则跳过 get_vc。"""
+    """缓存 VC 实例并记录已加载的权重名，命中则跳过 get_vc。
+
+    LRU 语义：命中即移到最新端；超过 _VC_CACHE_MAX 时从最旧端逐出（显式清理
+    CUDA 图缓存后丢弃引用，见 _dispose_vc / _reclaim_torch_memory）。"""
     with _vc_lock:
-        entry = _vc_cache.get(name)
+        entry = _vc_cache.pop(name, None)  # pop+回插：dict 序即 LRU 序（最新在尾）
         if entry is None:
             # 幂等兜底：绕过 main() 的入口若未设 weight_root，VC.get_vc 会拼出 "None/xxx.pth" 的误导性路径
             os.environ.setdefault("weight_root", str(paths.WEIGHTS_DIR))
@@ -51,11 +99,18 @@ def get_vc_cached(name: str):
             os.environ.setdefault("index_root", str(paths.INDICES_DIR))
             os.environ.setdefault("outside_index_root", str(paths.INDICES_DIR))
             entry = _CacheEntry(_build_vc())
-            _vc_cache[name] = entry
         if entry.loaded != name:
             entry.vc.get_vc(name)  # 抛异常时 loaded 保持 None，下次自动重试，不污染缓存
             entry.loaded = name
-        return entry.vc
+        _vc_cache[name] = entry
+        evicted = False
+        while len(_vc_cache) > max(_VC_CACHE_MAX, 1):
+            oldest = next(iter(_vc_cache))  # 刚插入的 name 恒在末尾，不会被选中
+            _dispose_vc(_vc_cache.pop(oldest).vc)
+            evicted = True
+    if evicted:
+        _reclaim_torch_memory()  # 锁外做 gc.collect + empty_cache（可能耗时几十 ms）
+    return entry.vc
 
 
 def _resolve_index_path(index_path: str) -> str:

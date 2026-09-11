@@ -24,6 +24,11 @@ async def lifespan(_: FastAPI):
     子进程会孤儿化（继续占 GPU/CPU 且无人能终止）。dispose 默认超时 10s，覆盖
     kill_process_tree 自身约 6s 的阻塞；放到线程池里执行，避免阻塞事件循环的关闭序列。"""
     training.restore_pending_tasks()
+    # 每个任务起跑前清空推理模型缓存（on_start 钩子，server/tasks.py）：VC（HuBERT/
+    # 生成器/CUDA 图池）在服务进程内只增不减，而训练/分离子进程需要数 GB 提交内存——
+    # 串行队列保证释放窗口内没有训练在跑，进行中的单次推理持局部引用不受影响。
+    # 摘要行由 tasks.py 写进任务日志，释放动作对用户可见。
+    task_manager.on_start = infer.release_all_vc
     yield
     import anyio
 

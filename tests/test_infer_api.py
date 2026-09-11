@@ -379,3 +379,65 @@ def test_infer_load_failure_retryable(monkeypatch, tmp_path):
     assert resp.status_code == 200
     assert vc.calls == 2
     assert vc.load_count == 1
+
+
+# ---------------------------------------------------------------------------
+# LRU 上限与释放（长会话内存积累的治理，见 server/api/infer.py 模块注释）
+# ---------------------------------------------------------------------------
+
+
+def test_vc_cache_lru_evicts_oldest(monkeypatch):
+    """超过 _VC_CACHE_MAX 时按 LRU 逐出最旧条目：上限 2 下 a→b→回a→c 应逐出 b。"""
+    made = {}
+
+    def factory():
+        vc = CountingVC()
+        made[f"vc{len(made)}"] = vc
+        return vc
+
+    monkeypatch.setattr(infer_api, "_build_vc", factory)
+    monkeypatch.setattr(infer_api, "_VC_CACHE_MAX", 2)
+
+    a = infer_api.get_vc_cached("a.pth")
+    b = infer_api.get_vc_cached("b.pth")
+    infer_api.get_vc_cached("a.pth")  # 命中即触活：LRU 序变为 b（旧）、a（新）
+
+    c = infer_api.get_vc_cached("c.pth")  # 超限 → 逐出最旧的 b
+    assert len(infer_api._vc_cache) == 2
+    assert "b.pth" not in infer_api._vc_cache
+    assert {"a.pth", "c.pth"} == set(infer_api._vc_cache)
+    assert infer_api.get_vc_cached("a.pth") is a  # a 未被误逐出
+    assert c is not b
+
+
+def test_vc_cache_disposes_evicted_entry(monkeypatch):
+    """逐出时对被逐出的 VC 做图缓存清理（_dispose_vc），即便 torch 栈未加载也不炸。"""
+    disposed = []
+    monkeypatch.setattr(infer_api, "_VC_CACHE_MAX", 1)
+    monkeypatch.setattr(infer_api, "_build_vc", lambda: CountingVC())
+    monkeypatch.setattr(infer_api, "_dispose_vc", lambda vc: disposed.append(vc))
+
+    infer_api.get_vc_cached("a.pth")
+    infer_api.get_vc_cached("b.pth")
+
+    assert len(disposed) == 1  # a.pth 的 VC 被逐出时清理
+    assert set(infer_api._vc_cache) == {"b.pth"}
+
+
+def test_release_all_vc_clears_cache_and_reports(monkeypatch):
+    made = [CountingVC(), CountingVC()]
+    it = iter(made)
+    monkeypatch.setattr(infer_api, "_build_vc", lambda: next(it))
+
+    infer_api.get_vc_cached("a.pth")
+    infer_api.get_vc_cached("b.pth")
+    note = infer_api.release_all_vc()
+
+    assert infer_api._vc_cache == {}
+    assert note is not None and "2" in note  # 摘要行带释放个数，进任务日志
+
+
+def test_release_all_vc_empty_returns_none(monkeypatch):
+    monkeypatch.setattr(infer_api, "_build_vc", lambda: CountingVC())
+
+    assert infer_api.release_all_vc() is None  # 无可释放时不往任务日志塞噪音行

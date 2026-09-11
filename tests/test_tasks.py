@@ -130,7 +130,10 @@ def test_create_task_runs_cmds_in_order_and_succeeds(factory, tmp_path):
     assert first["shell"] is True
     assert first["cwd"] == paths.ROOT
     assert first["stderr"] == subprocess.STDOUT
-    assert first["start_new_session"] is True  # POSIX 独立进程组，便于整树终止
+    if os.name == "nt":
+        assert first["creationflags"] == subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        assert first["start_new_session"] is True  # POSIX 独立进程组，便于整树终止
     assert first["stdout"].name == str(log_path)
     assert first["stdout"].mode == "wb"  # 默认 truncate=True：每 cmd 启动前截断（对齐 webui）
     assert calls[1]["stdout"] is not first["stdout"]  # 每个 cmd 独立句柄
@@ -1021,3 +1024,123 @@ def test_on_finish_none_is_noop(factory, tmp_path):
     manager, _, _ = factory([FakeProcess(0)])
     task_id = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
     wait_until(lambda: manager.get_task(task_id)["state"] == "success")  # 不回调也不报错
+
+
+# ---------------------------------------------------------------------------
+# 8. on_start 启动回调（推理缓存的内存让路挂载点）与提交内存守卫
+# ---------------------------------------------------------------------------
+
+
+def test_on_start_fires_before_setup_and_cmd(factory, tmp_path):
+    manager, calls, _ = factory([FakeProcess(0)])
+    order = []
+
+    def setup():
+        order.append("setup")
+
+    manager.on_start = lambda task: order.append("on_start")
+    task_id = manager.create_task(
+        "fit", ["cmd"], tmp_path / "a.log", setup=setup
+    )
+    wait_until(lambda: manager.get_task(task_id)["state"] == "success")
+
+    assert order == ["on_start", "setup"]  # 先释放内存，再跑前置与子进程
+    assert len(calls) == 1
+
+
+def test_on_start_note_lands_in_task_log(factory, tmp_path):
+    manager, _, _ = factory([FakeProcess(0)])
+    manager.on_start = lambda task: "已释放推理模型缓存：2 个"
+
+    task_id = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(task_id)["state"] == "success")
+
+    assert "已释放推理模型缓存：2 个" in manager.get_task(task_id)["logs"]
+
+
+def test_on_start_none_note_and_none_hook_are_noop(factory, tmp_path):
+    manager, _, _ = factory([FakeProcess(0)])
+    manager.on_start = lambda task: None  # 无摘要行的钩子
+    task_id = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(task_id)["state"] == "success")
+    assert manager.get_task(task_id)["logs"] == []
+
+    plain, _, _ = factory([FakeProcess(0)])  # 未挂钩子
+    other = plain.create_task("fit", ["cmd"], tmp_path / "b.log")
+    wait_until(lambda: plain.get_task(other)["state"] == "success")
+
+
+def test_on_start_exception_does_not_affect_task(factory, tmp_path):
+    manager, calls, _ = factory([FakeProcess(0)])
+
+    def broken(task):
+        raise RuntimeError("boom")
+
+    manager.on_start = broken
+    task_id = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(task_id)["state"] == "success")
+
+    assert len(calls) == 1  # 钩子故障不拦任务
+
+
+def test_headroom_guard_fails_task_before_popen(monkeypatch, factory, tmp_path):
+    """额度见底：任务在起任何子进程前就落 failed，错误信息可读。"""
+    monkeypatch.setattr(tasks, "_available_commit_bytes", lambda: int(0.5 * 1024**3))
+    manager, calls, _ = factory([FakeProcess(0)])
+
+    task_id = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(task_id)["state"] in TERMINAL_STATES)
+
+    snapshot = manager.get_task(task_id)
+    assert snapshot["state"] == "failed"
+    assert "可用内存不足" in snapshot["error"]
+    assert "页面文件太小" in snapshot["error"]
+    assert calls == []  # 子进程从未被启动
+
+
+def test_headroom_guard_passes_with_enough_memory(monkeypatch, factory, tmp_path):
+    monkeypatch.setattr(tasks, "_available_commit_bytes", lambda: 8 * 1024**3)
+    manager, calls, _ = factory([FakeProcess(0)])
+
+    task_id = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(task_id)["state"] == "success")
+
+    assert len(calls) == 1
+
+
+def test_headroom_guard_skipped_when_unavailable(monkeypatch, factory, tmp_path):
+    """探测不到额度（非 Windows 且无 psutil）→ 守卫必须跳过而非误杀。"""
+    monkeypatch.setattr(tasks, "_available_commit_bytes", lambda: None)
+    manager, calls, _ = factory([FakeProcess(0)])
+
+    task_id = manager.create_task("fit", ["cmd"], tmp_path / "a.log")
+    wait_until(lambda: manager.get_task(task_id)["state"] == "success")
+
+    assert len(calls) == 1
+
+
+def test_headroom_guard_checked_before_every_cmd(monkeypatch, factory, tmp_path):
+    """pipeline 多 cmd：额度在后续 cmd 起跑前再次检查（长任务中途耗尽也要拦）。
+
+    探测值用队列脚本化：第 1 次（cmd-a 前）充足，第 2 次（cmd-b 前）耗尽——
+    守卫每 cmd 调一次，时序因此确定，不依赖轮询窗口。"""
+    responses = iter([8 * 1024**3, 1])
+    monkeypatch.setattr(tasks, "_available_commit_bytes", lambda: next(responses))
+    manager, calls, _ = factory([FakeProcess(0), FakeProcess(0)])
+
+    task_id = manager.create_task("pipeline", ["cmd-a", "cmd-b"], tmp_path / "p.log")
+    wait_until(lambda: manager.get_task(task_id)["state"] in TERMINAL_STATES)
+
+    snapshot = manager.get_task(task_id)
+    assert snapshot["state"] == "failed"
+    assert "可用内存不足" in snapshot["error"]
+    assert len(calls) == 1  # cmd-a 已跑，cmd-b 未被启动
+
+
+def test_available_commit_bytes_smoke():
+    """真实环境冒烟：Windows 上返回正数；其他平台允许 None（无 psutil）。"""
+    value = tasks._available_commit_bytes()
+    if os.name == "nt":
+        assert value is not None and value > 0
+    else:
+        assert value is None or value > 0

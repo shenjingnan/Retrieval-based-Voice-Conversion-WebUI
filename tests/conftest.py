@@ -19,6 +19,12 @@ def _isolated_runtime_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(server_tasks.task_manager, "queue_store", None, raising=False)
     monkeypatch.setattr(server_tasks.task_manager, "on_finish", None, raising=False)
+    monkeypatch.setattr(server_tasks.task_manager, "on_start", None, raising=False)
+    # 提交内存守卫读真实系统额度——测试结果不得随宿主机当时的内存状态波动，
+    # 一律给健康值；守卫自身的用例在测试内再覆盖为不足值
+    monkeypatch.setattr(
+        server_tasks, "_available_commit_bytes", lambda: 8 * 1024**3, raising=False
+    )
     monkeypatch.setattr(server_training, "_history_store", None, raising=False)
     monkeypatch.setattr(server_training, "_history_cache", None, raising=False)
     monkeypatch.setattr(server_training, "_recorded_ids", set(), raising=False)
