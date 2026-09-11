@@ -2429,7 +2429,7 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                             "是否在每次保存时间点将最终小模型保存至weights文件夹"
                         ),
                         choices=[i18n("是"), i18n("否")],
-                        value=i18n("否"),
+                        value=i18n("是"),
                         interactive=True,
                     )
                 with gr.Row():

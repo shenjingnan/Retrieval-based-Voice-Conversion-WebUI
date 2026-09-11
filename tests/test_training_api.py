@@ -249,7 +249,7 @@ def test_fit_builds_command_without_pretrained(stub, client):
     assert call["name"] == "fit"
     assert call["cmds"] == [
         commands.build_fit_cmd(
-            "mi-test", "48k", True, 8, 20, 5, False, "", "", version="v2"
+            "mi-test", "48k", True, 8, 20, 5, True, "", "", version="v2"
         )
     ]
     assert "-pg" not in call["cmds"][0] and "-pd" not in call["cmds"][0]
@@ -309,7 +309,7 @@ def test_pipeline_builds_all_steps_in_one_task(stub, client, monkeypatch, tmp_pa
     assert call["cmds"][1] == commands.build_precheck_cmd("mi-test")
     assert call["cmds"][4] == commands.build_fitprep_cmd("mi-test", "48k", "v2", True)
     assert call["cmds"][5] == commands.build_fit_cmd(
-        "mi-test", "48k", True, 8, 20, 5, False, "", "", version="v2"
+        "mi-test", "48k", True, 8, 20, 5, True, "", "", version="v2"
     )
     assert call["log_path"] == paths.LOGS_DIR / "mi-test" / "pipeline_task.log"
     # setup 只承担 batch_size 默认值说明（显式传值时无输出）；产物校验必须走 precheck /

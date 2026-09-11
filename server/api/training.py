@@ -97,7 +97,7 @@ class FitBody(BaseModel):
     save_every_epoch: int
     # None（未指定）→ 按设备自适应解析（webui 滑条预填逻辑：最小显存GB÷2，无卡为 1）
     batch_size: int | None = None
-    save_every_weights: bool = False
+    save_every_weights: bool = True
 
 
 class IndexBody(BaseModel):

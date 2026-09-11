@@ -156,7 +156,7 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   const [saveEveryEpoch, setSaveEveryEpoch] = useState(5)
   /** null = 自动：提交时不发字段，由后端按设备自适应解析（webui 显存GB÷2，无卡为 1） */
   const [batchSize, setBatchSize] = useState<number | null>(null)
-  const [saveEveryWeights, setSaveEveryWeights] = useState(false)
+  const [saveEveryWeights, setSaveEveryWeights] = useState(true)
   /** 用户是否手动改过 batch size：改过就不再用 /api/train/defaults 的解析值覆盖 */
   const batchSizeTouched = useRef(false)
 
