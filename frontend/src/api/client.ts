@@ -95,12 +95,18 @@ export interface ClearQueueResult {
   cancelled_pending: number
 }
 
-/** DELETE /api/models/{name} 的返回体：联动删除的索引文件名列表见 server/api/models.py */
+/** DELETE /api/models/{name} 的返回体：彻底删除整组（权重 + 索引 + logs），字段见 server/api/models.py */
 export interface DeleteModelResult {
   deleted_model: string
+  /** 全组被删的权重文件名（含最终模型与中间轮次，含 deleted_model 本身） */
+  deleted_models: string[]
+  /** 删除失败（权限/占用等）的组内权重文件名；不回滚，如实上报 */
+  failed_models: string[]
   deleted_indices: string[]
   /** 删除失败（权限/占用等）的索引文件名；联动不回滚，如实上报 */
   failed_indices: string[]
+  /** logs/{exp} 训练产物清理结果：target 为绝对路径（本来就没有产物时为 null） */
+  logs: { target: string | null; removed: boolean; failed_files: string[] }
 }
 
 /** GET /api/datasets 的条目（server/api/datasets.py _scan_dataset 的 summary，逐字段对齐） */

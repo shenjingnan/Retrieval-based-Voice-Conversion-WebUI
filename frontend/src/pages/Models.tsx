@@ -4,8 +4,8 @@
  * 折叠子列表（groupModels 分组，见 lib/domain）；组卡片按最近训练时间倒序。
  * 代表项操作：去推理（跨 Tab 联动选中）、下载（一键 zip 打包 pth + 配对索引）、
  * 补训索引（实验名默认由模型名推导，可编辑；同组共享一个索引，故为组级操作）、
- * 删除（两段式确认；后端会联动删除会配对到它的索引）。
- * 中间轮次子项操作：去推理 / 下载 / 删除，与代表项同款（补训索引除外）。
+ * 删除（两段式确认；彻底删除：整组权重 + 配对索引 + logs/{exp} 训练产物）。
+ * 中间轮次子项操作：去推理 / 下载（删除是组级操作，只在组卡片上提供）。
  * 补训索引走 POST /api/train/index + useTask 显示进度与结果。
  */
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
@@ -59,11 +59,16 @@ interface WatchedIndexTask {
   taskId: string
 }
 
-/** 删除成功的回执提示：模型名 + 联动删除/删除失败的索引个数 */
+/** 删除成功的回执提示：整组权重 + 配对索引 + logs/{exp} 训练产物的清理结果 */
 interface DeletedReceipt {
   model: string
+  modelCount: number
+  failedModelCount: number
   indexCount: number
   failedCount: number
+  logsRemoved: boolean
+  logsTarget: string | null
+  logsFailedCount: number
 }
 
 /** Base UI Select 的 onValueChange 可能给 null（清空态），本页选项都必选，null 时忽略 */
@@ -74,6 +79,13 @@ function applySelect(v: string | null, set: (value: string) => void): void {
 /** 索引字段存的是绝对路径，卡片里只展示文件名 */
 function fileName(path: string): string {
   return path.split('/').pop() ?? path
+}
+
+/** 回执里 logs 清理结果的文案：本来就没有产物（target 为 null）不提，未清干净给残留提示 */
+function logsReceiptText(receipt: DeletedReceipt): string {
+  if (receipt.logsRemoved) return '；训练产物已清除'
+  if (receipt.logsTarget === null) return ''
+  return `；训练产物未能完全清除（残留 ${receipt.logsFailedCount} 个文件，可手动删除 ${receipt.logsTarget}）`
 }
 
 export interface ModelsPageProps {
@@ -155,11 +167,16 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
       if (!mounted.current) return
       setReceipt({
         model: result.deleted_model,
+        modelCount: result.deleted_models.length,
+        failedModelCount: result.failed_models.length,
         indexCount: result.deleted_indices.length,
         failedCount: result.failed_indices.length,
+        logsRemoved: result.logs.removed,
+        logsTarget: result.logs.target,
+        logsFailedCount: result.logs.failed_files.length,
       })
-      // 表单/监视区按组键渲染（indexForm.groupKey === g.key），删单个成员组还在，
-      // 不主动收起；整组删光后渲染条件自然不成立，残留状态无害（下次打开会覆盖）
+      // 表单/监视区按组键渲染（indexForm.groupKey === g.key），整组删除后渲染条件
+      // 自然不成立，残留状态无害（下次打开会覆盖）
       setReloadTick((t) => t + 1)
     } catch (e) {
       if (mounted.current) setDeleteError(errorMessage(e))
@@ -275,11 +292,23 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
         )}
 
         {receipt !== null && (
-          <p className="rounded-lg bg-emerald-500/10 p-3 text-xs text-emerald-700 dark:text-emerald-400">
-            已删除 {receipt.model}
-            {receipt.indexCount > 0 && `（含 ${receipt.indexCount} 个配对索引）`}
-            {receipt.failedCount > 0 && `，另有 ${receipt.failedCount} 个索引删除失败`}。
-          </p>
+          <div className="flex flex-col gap-1 rounded-lg bg-emerald-500/10 p-3 text-xs text-emerald-700 dark:text-emerald-400">
+            <p>
+              已删除 {receipt.model} 等共 {receipt.modelCount} 个权重文件（含中间轮次）
+              {receipt.indexCount > 0 && `、${receipt.indexCount} 个配对索引`}
+              {logsReceiptText(receipt)}。
+            </p>
+            {receipt.failedModelCount > 0 && (
+              <p className="text-amber-600 dark:text-amber-400">
+                另有 {receipt.failedModelCount} 个组内权重删除失败。
+              </p>
+            )}
+            {receipt.failedCount > 0 && (
+              <p className="text-amber-600 dark:text-amber-400">
+                另有 {receipt.failedCount} 个索引删除失败。
+              </p>
+            )}
+          </div>
         )}
         {deleteError !== null && (
           <p role="alert" className="rounded-lg bg-destructive/10 p-3 text-xs text-destructive">
@@ -294,6 +323,8 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
           const canReindex = exp.length > 0
           // 训练未完成（只有中间轮次）或最终模型被单独删除：代表项退化为最大轮次的中间产物
           const noFinal = g.final === null && g.intermediates.length > 0
+          // 整组权重文件数（最终模型 + 全部中间轮次），删除确认文案里如实报数
+          const memberCount = (g.final !== null ? 1 : 0) + g.intermediates.length
           // 该组补训索引任务进行中：删除任何成员都会让正在建立索引的实验失去主体，全组先禁用
           const reindexingThisGroup =
             watched !== null && watched.groupKey === g.key && running
@@ -355,7 +386,9 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                     disabled={deleting !== null || reindexingThisGroup}
                     onClick={() => onDeleteClick(rep.name)}
                     title={
-                      reindexingThisGroup ? '该实验正在补训索引，任务结束后再删除' : undefined
+                      reindexingThisGroup
+                        ? '该实验正在补训索引，任务结束后再删除'
+                        : '彻底删除该组的全部产物（权重 + 索引 + logs 训练产物）'
                     }
                   >
                     {deleting === rep.name && <LoaderCircleIcon className="animate-spin" />}
@@ -364,14 +397,16 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                 </div>
               </div>
 
-              {/* 两段式确认的说明：删除会连带配对规则命中的全部索引（后端联动），
-                  同源模型可能共用同一索引，影响范围可能大于当前显示的配对，必须让用户知情 */}
+              {/* 两段式确认的说明：删除 = 彻底删除整组（全部轮次 + 配对索引 +
+                  logs/{exp} 训练产物，体积大头且不可恢复、无法再补训索引） */}
               {confirmDelete === rep.name && (
                 <p className="text-xs text-amber-600 dark:text-amber-400">
-                  将删除该模型，及其按配对规则命中的全部索引
+                  将彻底删除该组全部产物：{memberCount} 个权重文件（含最终模型与中间轮次）
+                  、按配对规则命中的全部索引
                   {rep.index !== null ? `（当前配对：${fileName(rep.index)}）` : '（当前无配对索引）'}
-                  ；同源模型可能共用同一索引，删除后它们也会失去索引。再次点击按钮确认，3
-                  秒后自动取消。
+                  {exp.length > 0 &&
+                    `，以及 logs/${exp} 下的训练特征与 checkpoint（体积最大，通常数 GB）`}
+                  。删除后无法恢复，也不能再用这些产物补训索引。再次点击按钮确认，3 秒后自动取消。
                 </p>
               )}
 
@@ -522,8 +557,8 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
               )}
 
               {/* 中间轮次折叠子列表：默认收起，epoch 升序（训练演进顺序）。
-                  子项与代表项同款操作（去推理/下载/删除）；补训索引是组级操作
-                  （同组共享一个索引），不重复出现。文件名剥不出轮次时原样展示 */}
+                  子项操作只有去推理/下载——删除是组级操作（整组彻底删除），
+                  只在组卡片上提供。文件名剥不出轮次时原样展示 */}
               {g.intermediates.length > 0 && (
                 <Collapsible>
                   <CollapsibleTrigger className="flex items-center gap-1 self-start rounded-lg px-2 py-1.5 text-sm text-muted-foreground select-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none [&_svg]:transition-transform [&[aria-expanded=true]_svg]:rotate-180">
@@ -564,35 +599,7 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                                 <DownloadIcon />
                                 下载
                               </Button>
-                              <Button
-                                size="sm"
-                                variant="destructive"
-                                disabled={deleting !== null || reindexingThisGroup}
-                                onClick={() => onDeleteClick(m.name)}
-                                title={
-                                  reindexingThisGroup
-                                    ? '该实验正在补训索引，任务结束后再删除'
-                                    : undefined
-                                }
-                              >
-                                {deleting === m.name && (
-                                  <LoaderCircleIcon className="animate-spin" />
-                                )}
-                                {confirmDelete === m.name ? '确认删除？' : '删除'}
-                              </Button>
                             </div>
-                            {/* 子项的两段式确认说明：索引是全组共用的，删任何成员
-                                都会联动删掉它，其余轮次随之失去索引，必须让用户知情 */}
-                            {confirmDelete === m.name && (
-                              <p className="w-full text-xs text-amber-600 dark:text-amber-400">
-                                将删除该中间模型，及其按配对规则命中的全部索引
-                                {m.index !== null
-                                  ? `（当前配对：${fileName(m.index)}）`
-                                  : '（当前无配对索引）'}
-                                ；本组模型共用该索引，删除后其余轮次也会失去索引。再次点击按钮确认，3
-                                秒后自动取消。
-                              </p>
-                            )}
                           </div>
                         )
                       })}
