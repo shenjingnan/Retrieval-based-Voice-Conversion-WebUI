@@ -74,6 +74,27 @@ function applySelect(v: string | null, set: (value: string) => void): void {
   if (v !== null) set(v)
 }
 
+/**
+ * 自动实验名：voice-月日时分-随机后缀。时间因子保证新实验不续进旧目录，
+ * 随机后缀兜掉同分钟内重开的碰撞。
+ */
+function autoExpName(): string {
+  const now = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `voice-${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}-${randomHex(4)}`
+}
+
+/**
+ * 镜像 server/api/training.py _check_exp_name 的字符规则（空串合法 = 自动生成，
+ * 由调用方先行放行；NUL 输入框打不出不查）。true = 含空白/引号/反斜杠/$/反引号/
+ * 路径分隔符，或恰为 "." / ".."。规则改动须与后端同步。
+ */
+function expNameInvalid(name: string): boolean {
+  return (
+    /[ \t\r\n"\\$`]/.test(name) || name.includes('/') || name === '.' || name === '..'
+  )
+}
+
 interface NumberFieldProps {
   id: string
   label: string
@@ -116,7 +137,12 @@ export interface TrainingPageProps {
 
 export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   // -- 表单（基础） ---------------------------------------------------------
+  // 实验名可选：留空自动生成；填写则用用户的（冲突由输入时检查 + 后端 409 兜底拦截）
   const [expName, setExpName] = useState('')
+  /** 占用检查结果（与查询时的名字绑定）：渲染时按当前名字派生占用态，名字一变提示即消失 */
+  const [expNameCheck, setExpNameCheck] = useState<{ name: string; exists: boolean } | null>(
+    null,
+  )
   // 参考音频唯一来源：DatasetPicker（上传会话），路径由后端下发
   const [pickedPath, setPickedPath] = useState('')
   // 提交成功后整组重置：remount DatasetPicker 才能丢弃旧上传会话（ds-xxxxxxxx）
@@ -209,11 +235,37 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   const { stats: sysStats, stale: sysStale } = useSystemStats()
 
   // -- 校验（派生） ---------------------------------------------------------
-  // 实验名对用户隐藏：提交时自动生成；路径由后端下发，天然合法，只要求已选择
+  // 实验名：本地格式校验即时反馈（不发非法名请求，后端同一张表兜 400）；
+  // 路径由后端下发，天然合法，只要求已选择
+  const expNameErr =
+    expName.length > 0 && expNameInvalid(expName)
+      ? '实验名不能包含空格、引号、$、`、反斜杠或路径分隔符'
+      : null
+  const expNameTaken =
+    expNameCheck !== null && expNameCheck.name === expName && expNameCheck.exists
   const datasetValid = pickedPath.length > 0
   const epochsValid =
     totalEpoch >= 1 && saveEveryEpoch >= 1 && (batchSize === null || batchSize >= 1)
-  const formValid = datasetValid && epochsValid
+  const formValid = datasetValid && epochsValid && expNameErr === null && !expNameTaken
+
+  // 实验名占用检查：输入停顿 400ms 后查询（防抖）。结果与查询时的名字绑定写入，
+  // 迟到响应由 ref 比对丢弃（不覆盖新名字的检查结果）；检查失败静默——提交时
+  // 后端 409 兜底，不阻塞表单
+  const expNameRef = useRef('')
+  useEffect(() => {
+    expNameRef.current = expName
+    if (expName.length === 0 || expNameInvalid(expName)) return // 空名自动生成；非法名不发请求
+    const name = expName
+    const timer = window.setTimeout(() => {
+      api
+        .trainExpNameExists(name)
+        .then((r) => {
+          if (expNameRef.current === name) setExpNameCheck({ name, exists: r.exists })
+        })
+        .catch(() => undefined)
+    }, 400)
+    return () => window.clearTimeout(timer)
+  }, [expName])
 
   // v1 没有 32k 档（server/api/training.py _normalize_sr，webui change_version19 语义）
   const normalizedSr: SampleRate = version === 'v1' && sr === '32k' ? '40k' : sr
@@ -233,18 +285,11 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
     prefillBatchSize()
   }, [prefillBatchSize])
 
-  function currentParams(freshExp: boolean): TrainParams {
-    // 实验名隐藏：提交时生成 voice-月日时分-随机后缀 并记进 state（分步重试等场景
-    // 沿用同一实验名）。freshExp=true（一键训练）：每次提交都是全新实验——排队开放
-    // 后同一页面会连续提交多个任务，复用首个实验名会触发后端的同名实验互斥（409）。
-    // 时间因子保证新实验不会续进旧目录，随机后缀兜掉同分钟内重开的碰撞
-    let resolvedExpName = expName
-    if (resolvedExpName.length === 0 || freshExp) {
-      const now = new Date()
-      const pad = (n: number) => String(n).padStart(2, '0')
-      resolvedExpName = `voice-${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}-${randomHex(4)}`
-      setExpName(resolvedExpName)
-    }
+  function currentParams(): TrainParams {
+    // 实验名可选：填了用用户的；留空则每次提交现场生成全新自动名（排队开放后同一
+    // 页面会连续提交多个任务，复用实验名会触发同名互斥/目录冲突）。不写回 state：
+    // 提交失败重试自然换新名，不会反复撞同一个 409
+    const resolvedExpName = expName.length > 0 ? expName : autoExpName()
     return {
       exp_name: resolvedExpName,
       dataset_dir: pickedPath,
@@ -278,7 +323,7 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
   }
 
   async function startPipeline() {
-    const params = currentParams(true) // 一键训练 = 全新实验
+    const params = currentParams()
     setSubmitting(true)
     setSubmitError(null)
     try {
@@ -312,12 +357,16 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
     }
   }
 
-  /** 失败/停止任务的「重新提交」：同名实验 = 断点续训；不重置表单（与本任务无关） */
+  /** 失败/停止任务的「重新提交」：同名实验 = 断点续训；不重置表单（与本任务无关）。
+   *  失败任务的实验目录必然已存在，显式带 allow_existing 绕过占用检查（409） */
   async function resubmitTask(params: Record<string, unknown>) {
     setResubmitBusy(true)
     setSubmitError(null)
     try {
-      const created = await api.trainPipeline(params as unknown as TrainParams)
+      const created = await api.trainPipeline({
+        ...params,
+        allow_existing: true,
+      } as unknown as TrainParams)
       if (!mounted.current) return
       setExpandedId(created.task_id)
       refreshQueue()
@@ -341,6 +390,28 @@ export function TrainingPage({ onGoInfer }: TrainingPageProps) {
         <CardTitle>训练</CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-6">
+        {/* 表单：实验名（可选）。占用/非法在输入时即时提示，提交时后端 409/400 兜底 */}
+        <div className="flex flex-col gap-1.5">
+          <label htmlFor="train-exp-name" className="text-sm font-medium">
+            实验名<span className="font-normal text-muted-foreground">（可选）</span>
+          </label>
+          <Input
+            id="train-exp-name"
+            type="text"
+            value={expName}
+            onChange={(e) => setExpName(e.target.value)}
+            placeholder="留空自动生成，如 voice-0911-1430-a1b2"
+            autoComplete="off"
+          />
+          {expNameErr !== null ? (
+            <p className="text-xs text-destructive">{expNameErr}</p>
+          ) : expNameTaken ? (
+            <p className="text-xs text-destructive">
+              该实验名已存在，请换一个；要基于已有产物续训，请在下方任务历史中使用「重新提交」
+            </p>
+          ) : null}
+        </div>
+
         {/* 表单：参考音频。提交成功后整组重置（pickerKey remount 开新上传会话） */}
         <div className="flex flex-col gap-4">
           <span className="text-sm font-medium">参考音频</span>
