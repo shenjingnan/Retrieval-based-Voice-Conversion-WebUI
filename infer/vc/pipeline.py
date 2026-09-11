@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from scipy import signal
 
 from infer.hubert import extract_hubert_features
-from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
+from tools.cuda_graph import cuda_graph_applies, cuda_graph_enabled, run_cuda_graph
 
 bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=16000)
 
@@ -216,6 +216,9 @@ class Pipeline(object):
             feats = feats * pitchff + feats0 * (1 - pitchff)
             feats = feats.to(feats0.dtype)
         p_len = torch.tensor([p_len], device=self.device).long()
+        # run_cuda_graph 内部会做同一判定；此处结论用于事后 empty_cache：图开但本次
+        # 片段超帧数上限走 eager 时，中间激活落在常规缓存池里，同样需要归还
+        graphed = cuda_graph_applies(self.device, feats)
         with torch.no_grad():
             hasp = pitch is not None and pitchf is not None
             if hasp:
@@ -245,7 +248,7 @@ class Pipeline(object):
             audio1 = synthesized[0, 0].data.cpu().float().numpy()
             del hasp, synthesized
         del feats, p_len, padding_mask
-        if torch.cuda.is_available() and not cuda_graph_enabled(self.device):
+        if torch.cuda.is_available() and not graphed:
             torch.cuda.empty_cache()
         t2 = ttime()
         times[0] += t1 - t0
