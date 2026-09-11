@@ -260,6 +260,14 @@ export const api = {
       handle<DeleteModelResult>(r),
     ),
 
+  /**
+   * 模型一键打包下载地址（GET，返回含 pth + 配对索引的 zip，server/api/models.py
+   * download_model）。下载不走 fetch——大文件进 JS 内存没有意义，直接给 a 标签
+   * 让浏览器原生下载，三端拿到 zip 后自行解压。
+   */
+  modelDownloadUrl: (name: string): string =>
+    `/api/models/${encodeURIComponent(name)}/download`,
+
   infer: (form: FormData): Promise<Blob> =>
     fetch('/api/infer', { method: 'POST', body: form }).then(async (r) => {
       if (!r.ok) throw await errorFrom(r)

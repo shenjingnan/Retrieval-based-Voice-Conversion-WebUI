@@ -1,11 +1,12 @@
 /**
  * 模型管理页（P2）：assets/weights 的模型卡片列表。
- * 卡片操作：去推理（跨 Tab 联动选中）、补训索引（实验名默认由模型名推导，可编辑）、
+ * 卡片操作：去推理（跨 Tab 联动选中）、下载（一键 zip 打包 pth + 配对索引，浏览器原生下载）、
+ * 补训索引（实验名默认由模型名推导，可编辑）、
  * 删除（两段式确认；后端会联动删除会配对到它的索引）。
  * 补训索引走 POST /api/train/index + useTask 显示进度与结果。
  */
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
-import { LoaderCircleIcon, RefreshCwIcon } from 'lucide-react'
+import { DownloadIcon, LoaderCircleIcon, RefreshCwIcon } from 'lucide-react'
 
 import { api, type ModelVersion, type RvcModel } from '@/api/client'
 import { useTask } from '@/hooks/useTask'
@@ -292,6 +293,17 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                 <div className="flex items-center gap-2">
                   <Button size="sm" variant="outline" onClick={() => onGoInfer(m.name)}>
                     去推理
+                  </Button>
+                  {/* 下载：a 标签原生下载（服务端 Content-Disposition 定名），
+                      缺索引时包内只有 pth，下载本身不被拦截 */}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    render={<a href={api.modelDownloadUrl(m.name)} />}
+                    title="下载模型包（zip，含 pth 与配对索引）"
+                  >
+                    <DownloadIcon />
+                    下载
                   </Button>
                   {m.index === null && canReindex && (
                     <Button
