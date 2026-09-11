@@ -1,4 +1,6 @@
-"""扫描 assets/weights 与 assets/indices，返回模型及其索引配对。"""
+"""扫描 assets/weights 与 assets/indices，返回模型及其索引配对；
+删除模型 = 彻底删除：整组权重 + 配对索引 + logs/{exp} 训练产物。"""
+import contextlib
 import logging
 import re
 import zipfile
@@ -11,6 +13,12 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from server import paths
+# 跨模块私有 import 有先例（datasets.py 对 training._EXP_FORBIDDEN）；main.py 的
+# create_app 本就全量加载两个 router，无环、无额外 import 重量。测试 patch 的是
+# training 命名空间里的 task_manager/_TASK_META——_ensure_exp_idle 在调用期从
+# training 模块 globals 解析它们，因此借用方（本模块）不需要任何 patch。
+from server.api.datasets import _rmtree_best_effort
+from server.api.training import _ensure_exp_idle
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +111,45 @@ def list_models():
     return _scan()
 
 
+def _delete_file(path: Path) -> None:
+    """unlink 的薄封装：仅为测试提供打桩点（组内某个成员删除失败的可测注入）。"""
+    path.unlink()
+
+
+def _locate_logs_dir(exp: str, exp_raw: str) -> Path | None:
+    """定位 logs/{exp}，找不到返回 None（视为已清理，不是错误）。
+
+    logs 目录名保留用户提交实验名时的原始大小写（EXP_NAME_RE 允许大写，Linux
+    大小写敏感），而 weights 文件名与索引配对走 lower 口径——故先按文件名原始
+    大小写探测，再按 lower 探测，最后遍历 LOGS_DIR 做大小写不敏感兜底。
+    安全兜底：候选必须仍是 basename（Path(x).name != x 或 "." / ".." 一律跳过，
+    绝不 rmtree LOGS_DIR 之外的路径）；logs/mute 是全局共享静音资产（训练侧
+    preprocess 的 0 秒静音样本源），永不删除。
+    """
+    if not paths.LOGS_DIR.is_dir():
+        return None
+    for cand in dict.fromkeys([exp_raw, exp]):  # 去重保序：原始 case 优先
+        if not cand or cand in (".", "..") or Path(cand).name != cand:
+            continue
+        target = paths.LOGS_DIR / cand
+        if target.is_dir() and target.name.lower() != "mute":
+            return target
+    for entry in paths.LOGS_DIR.iterdir():
+        if entry.name.lower() == exp and entry.is_dir() and entry.name.lower() != "mute":
+            return entry
+    return None
+
+
 @router.delete("/models/{name}")
 def delete_model(name: str):
-    """删除模型权重，并联动删除会配对到它的索引。
+    """彻底删除一个模型组：组内全部权重 + 配对索引 + logs/{exp} 训练产物。
 
-    联动范围取配对规则的候选全集（_index_matches 命中且非 spkid），而不是只删
+    「组」= weights 下 experiment_name(stem).lower() 相同的全部 *.pth（最终产物
+    与全部中间轮次），与索引配对同口径（case-insensitive）。前端只在组卡片上提供
+    删除按钮；noFinal 组（训练中断只剩中间产物）由代表项（最大轮次）发起，同样
+    删整组。
+
+    索引联动范围取配对规则的候选全集（_index_matches 命中且非 spkid），而不是只删
     GET /api/models 当前选中的那一个——否则同实验的旧索引会残留成孤儿；相似实验名
     （bob / bobby）因匹配规则带边界不会被牵连。防穿越与 infer.py 同手法：非 basename
     一律 404，绝不触达 weights 目录之外的路径（"." / ".." 单独拒绝：Python 3.13 起
@@ -115,8 +157,24 @@ def delete_model(name: str):
     路由层只匹配单段）。仅接受 .pth 后缀（与 GET 扫描的 *.pth 一致），weights 下的
     杂物文件（说明文档、备份残片等）不由本接口删除。
 
-    索引联动不具原子性：单个索引删除失败（权限/占用等）不回滚也不 500，收集进
-    failed_indices 如实上报；模型权重自身的 unlink 失败仍然抛 500（删除没发生）。
+    logs/{exp} 是训练产物的体积大头（checkpoint、预处理特征、索引真实体），随组
+    一并删除——删除后无法再用这些产物补训索引。目录名保留用户提交实验名时的原始
+    大小写而 weights/索引配对走 lower 口径，故按原始 case → lower → 遍历兜底定位
+    （_locate_logs_dir）；logs/mute 是全局共享静音资产，永不删除。删除后再清扫
+    assets/indices 里仍指向该目录的残余软链（*_spkidN 等不在配对候选里的链接），
+    否则它们会永久悬空堆积（GET 靠 is_file() 过滤不会 500，但会越积越多）。
+
+    在训保护：该实验（原始 case 与 lower 两个候选都查——任务元数据里的 exp_name
+    是提交时的原始大小写，weights 文件名大小写可能与之不一致）存在非终态任务时
+    409，绝不截断正在写 logs 的训练。
+
+    退化文件名（如 _e20_s100.pth）剥不出实验名（exp == ""）：退回旧行为，只删被
+    点名的文件，不联动索引、不碰 logs。
+
+    失败纪律（与 datasets.delete_dataset 有意分歧）：datasets 里目录就是产品，整树
+    删不动给 500；本接口的产品是权重与索引，logs 只是附带清理。点名权重自身 unlink
+    失败 → 500（删除未发生）；组内其余权重、索引、logs 树的逐项失败不回滚也不
+    500，分别收进 failed_models / failed_indices / logs.failed_files 如实上报。
     """
     if (
         name in (".", "..")
@@ -126,23 +184,92 @@ def delete_model(name: str):
     ):
         raise HTTPException(404, f"模型不存在: {name}")
     model_path = paths.WEIGHTS_DIR / name
-    exp = experiment_name(model_path.stem).lower()
-    paired = _paired_indices(exp, _list_indices())
-    model_path.unlink()
-    deleted_indices = []
-    failed_indices = []
-    for index_path in paired:
+    exp_raw = experiment_name(model_path.stem)  # 原始大小写：logs 目录名候选
+    exp = exp_raw.lower()
+
+    deleted_models: list = []
+    failed_models: list = []
+    deleted_indices: list = []
+    failed_indices: list = []
+    logs_result = {"target": None, "removed": False, "failed_files": []}
+
+    if exp:  # 退化 stem（exp == ""）走不到这里：只删点名文件
+        # 在训守卫放最前：任何删除动作都不该发生在活跃任务存在时
+        for cand in dict.fromkeys([exp_raw, exp]):
+            _ensure_exp_idle(cand)  # 命中即抛 HTTPException(409)
+
+        # 删任何东西之前先完成枚举与定位，失败语义不依赖中途状态
+        members = [
+            p
+            for p in paths.WEIGHTS_DIR.glob("*.pth")
+            if p.is_file() and experiment_name(p.stem).lower() == exp
+        ]
+        logs_dir = _locate_logs_dir(exp, exp_raw)
+        paired = _paired_indices(exp, _list_indices())
+
+        # 点名者先行：它删不掉就 500，整组保持原样
         try:
-            index_path.unlink()
+            _delete_file(model_path)
         except OSError:
-            logger.exception("删除索引失败：%s", index_path)
-            failed_indices.append(index_path.name)
-        else:
-            deleted_indices.append(index_path.name)
+            logger.exception("删除模型失败：%s", model_path)
+            raise HTTPException(500, f"模型删除失败: {name}") from None
+        deleted_models.append(name)
+        for member in members:
+            # is_file 兜底两类同名异写：macOS/Windows 大小写不敏感 FS 上"alice.pth"
+            # 与磁盘上的 "Alice.pth" 是同一文件（点名删除已把它删掉，再按组员删会
+            # FileNotFoundError），也顺带防扫描与删除之间的竞态。
+            if member == model_path or not member.is_file():
+                continue
+            try:
+                _delete_file(member)
+            except OSError:
+                logger.exception("删除组内权重失败：%s", member)
+                failed_models.append(member.name)
+            else:
+                deleted_models.append(member.name)
+
+        for index_path in paired:
+            try:
+                index_path.unlink()
+            except OSError:
+                logger.exception("删除索引失败：%s", index_path)
+                failed_indices.append(index_path.name)
+            else:
+                deleted_indices.append(index_path.name)
+
+        if logs_dir is not None:
+            failed_files: list = []
+            try:
+                _rmtree_best_effort(logs_dir, failed_files)
+            except OSError:
+                logger.exception("训练产物目录删除失败：%s", logs_dir)
+            logs_result["target"] = str(logs_dir)
+            logs_result["failed_files"] = failed_files
+            logs_result["removed"] = not logs_dir.exists()
+
+            # 清扫仍指向该 logs 目录的残余软链（spkid / 悬空链不在配对候选里）。
+            # 只处理 symlink：Windows 硬链在 indices 下是独立实体，rmtree 不影响它。
+            if paths.INDICES_DIR.is_dir():
+                for link in paths.INDICES_DIR.glob("*.index"):
+                    with contextlib.suppress(OSError):
+                        if link.is_symlink() and link.resolve().is_relative_to(logs_dir):
+                            link.unlink(missing_ok=True)
+
+    else:
+        try:
+            _delete_file(model_path)
+        except OSError:
+            logger.exception("删除模型失败：%s", model_path)
+            raise HTTPException(500, f"模型删除失败: {name}") from None
+        deleted_models.append(name)
+
     return {
-        "deleted_model": name,
+        "deleted_model": name,  # 兼容保留：被点名者
+        "deleted_models": deleted_models,
+        "failed_models": failed_models,
         "deleted_indices": deleted_indices,
         "failed_indices": failed_indices,
+        "logs": logs_result,
     }
 
 

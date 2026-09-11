@@ -1,10 +1,14 @@
 import io
 import os
 import zipfile
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from server import paths
+from server.api import models as models_module
+from server.api import training as training_module
 from server.api.models import _index_matches
 from server.main import create_app
 
@@ -13,6 +17,21 @@ def _touch(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"x")
     return path
+
+
+@pytest.fixture(autouse=True)
+def isolated_logs(monkeypatch, tmp_path):
+    """删除接口会 rmtree logs/{exp}：把 LOGS_DIR 指到 tmp，测试绝不触碰真实 logs/。
+    只 patch LOGS_DIR 不 patch ROOT——models 的其余路径都不依赖 ROOT，缩小爆炸半径。"""
+    monkeypatch.setattr(paths, "LOGS_DIR", tmp_path / "logs")
+
+
+def _make_logs(tmp_path, exp):
+    """造一个最小但形态齐全的 logs/{exp} 训练产物目录（特征/权重/索引真身）。"""
+    logs_exp = tmp_path / "logs" / exp
+    _touch(logs_exp / "0_gt_wavs" / "a.wav")
+    _touch(logs_exp / "G_50.pth")
+    return logs_exp
 
 
 def test_models_scan_and_pair(monkeypatch, tmp_path):
@@ -136,7 +155,11 @@ def test_delete_model_with_paired_indices(monkeypatch, tmp_path):
     assert resp.status_code == 200
     body = resp.json()
     assert body["deleted_model"] == "alice_v2_e20_s100.pth"
+    assert body["deleted_models"] == ["alice_v2_e20_s100.pth"]
+    assert body["failed_models"] == []
     assert sorted(body["deleted_indices"]) == sorted([added.name, linked.name])
+    # 组内只有这一个成员，logs/{exp} 不存在：附带清理为"无目标"，不算失败
+    assert body["logs"] == {"target": None, "removed": False, "failed_files": []}
     assert not (weights / "alice_v2_e20_s100.pth").exists()
     assert not added.exists() and not linked.exists()
     assert other.exists()
@@ -152,12 +175,15 @@ def test_delete_model_without_index(monkeypatch, tmp_path):
     resp = TestClient(create_app()).delete("/api/models/bob.pth")
 
     assert resp.status_code == 200
-    assert resp.json()["deleted_indices"] == []
+    body = resp.json()
+    assert body["deleted_indices"] == []
+    assert body["deleted_models"] == ["bob.pth"]
     assert not (weights / "bob.pth").exists()
 
 
 def test_delete_model_degenerate_stem_keeps_indices(monkeypatch, tmp_path):
-    """退化文件名（_e20_s100.pth）剥不出实验名 → 联动为空，索引一个都不动。"""
+    """退化文件名（_e20_s100.pth）剥不出实验名 → 联动为空，索引一个都不动，
+    也不碰 logs（保持旧行为：只删被点名的文件）。"""
     weights = tmp_path / "weights"
     indices = tmp_path / "indices"
     _touch(weights / "_e20_s100.pth")
@@ -168,14 +194,22 @@ def test_delete_model_degenerate_stem_keeps_indices(monkeypatch, tmp_path):
     resp = TestClient(create_app()).delete("/api/models/_e20_s100.pth")
 
     assert resp.status_code == 200
-    assert resp.json() == {"deleted_model": "_e20_s100.pth", "deleted_indices": [], "failed_indices": []}
+    assert resp.json() == {
+        "deleted_model": "_e20_s100.pth",
+        "deleted_models": ["_e20_s100.pth"],
+        "failed_models": [],
+        "deleted_indices": [],
+        "failed_indices": [],
+        "logs": {"target": None, "removed": False, "failed_files": []},
+    }
     assert kept.exists()
 
 
 def test_delete_model_shared_index_documented_ambiguity(monkeypatch, tmp_path):
     """【文档化决策】配对规则的多对一歧义：added_..._alice_v2.index 同时命中
     alice.pth（"_alice_" 子串）与 alice_v2.pth（"_alice_v2" 结尾）。删除任一方都会把
-    该索引删掉，另一方（仍存在）失去索引——确认文案已向用户声明该影响范围。"""
+    该索引删掉，另一方（仍存在）失去索引——确认文案已向用户声明该影响范围。
+    组口径下该歧义依旧存在：alice 与 alice_v2 是两个不同的组。"""
     weights = tmp_path / "weights"
     indices = tmp_path / "indices"
     _touch(weights / "alice.pth")
@@ -291,10 +325,12 @@ def test_delete_model_multi_segment_never_reaches_handler(monkeypatch, tmp_path,
 
 
 def test_delete_model_keeps_similar_experiment_index(monkeypatch, tmp_path):
-    """联动范围精确性：删除 bob 不得牵连 bobby 的索引（裸子串会误配）。"""
+    """联动范围精确性：删除 bob 不得牵连 bobby 的索引（裸子串会误配），
+    也不得动 bobby 的权重与 logs（组判定带同样边界）。"""
     weights = tmp_path / "weights"
     indices = tmp_path / "indices"
     _touch(weights / "bob.pth")
+    bobby = _touch(weights / "bobby.pth")
     bobby_index = _touch(indices / "added_IVF128_Flat_nprobe_1_bobby.index")
     monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
     monkeypatch.setattr("server.paths.INDICES_DIR", indices)
@@ -302,8 +338,10 @@ def test_delete_model_keeps_similar_experiment_index(monkeypatch, tmp_path):
     resp = TestClient(create_app()).delete("/api/models/bob.pth")
 
     assert resp.status_code == 200
-    assert resp.json()["deleted_indices"] == []
-    assert bobby_index.exists()
+    body = resp.json()
+    assert body["deleted_indices"] == []
+    assert body["deleted_models"] == ["bob.pth"]
+    assert bobby_index.exists() and bobby.exists()
 
 
 def test_delete_model_ignores_spkid_index(monkeypatch, tmp_path):
@@ -320,6 +358,290 @@ def test_delete_model_ignores_spkid_index(monkeypatch, tmp_path):
     assert resp.status_code == 200
     assert resp.json()["deleted_indices"] == []
     assert spkid.exists()
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/models/{name}：彻底删除（整组权重 + 索引 + logs/{exp}）
+# ---------------------------------------------------------------------------
+
+
+def test_delete_group_removes_all_members_indices_and_logs(monkeypatch, tmp_path):
+    """删组主路径：最终产物 + 全部中间轮次 + 配对索引 + logs/{exp} 全链路删净，
+    别人的权重不受牵连。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    _touch(weights / "alice.pth")
+    _touch(weights / "alice_e10_s5000.pth")
+    _touch(weights / "alice_e20_s100.pth")
+    kept = _touch(weights / "bob.pth")
+    added = _touch(indices / "added_IVF1_Flat_nprobe_1_alice.index")
+    logs_exp = _make_logs(tmp_path, "alice")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", indices)
+
+    resp = TestClient(create_app()).delete("/api/models/alice.pth")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert sorted(body["deleted_models"]) == [
+        "alice.pth",
+        "alice_e10_s5000.pth",
+        "alice_e20_s100.pth",
+    ]
+    assert body["failed_models"] == []
+    assert body["deleted_indices"] == [added.name]
+    assert body["logs"] == {"target": str(logs_exp), "removed": True, "failed_files": []}
+    assert not added.exists()
+    assert not logs_exp.exists()
+    assert kept.exists()
+
+
+def test_delete_group_case_insensitive_members_and_logs(monkeypatch, tmp_path):
+    """组成员与 logs 目录都按大小写不敏感判定：请求大写文件名也要删掉小写
+    实验名的组员与 logs 目录（Linux 大小写敏感 FS 上这里是 lower 探测在起作用）。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    _touch(weights / "Alice_e20_s100.pth")
+    _touch(weights / "alice.pth")
+    logs_exp = _make_logs(tmp_path, "alice")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).delete("/api/models/Alice_e20_s100.pth")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert sorted(body["deleted_models"]) == ["Alice_e20_s100.pth", "alice.pth"]
+    assert body["logs"]["removed"] is True
+    # 目标目录名随平台探测路径不同（macOS 大小写不敏感 FS 会以别名路径命中），
+    # 只断言实验名命中，不锁全路径
+    assert Path(body["logs"]["target"]).name.lower() == "alice"
+    assert not logs_exp.exists()
+
+
+@pytest.mark.parametrize("logs_setup", ["missing_root", "missing_exp"])
+def test_delete_group_tolerates_missing_logs_dir(monkeypatch, tmp_path, logs_setup):
+    """logs 根目录不存在 / 存在但无该实验子目录：都视为"无产物可清"，正常 200。"""
+    weights = tmp_path / "weights"
+    _touch(weights / "alice.pth")
+    if logs_setup == "missing_exp":
+        _touch(tmp_path / "logs" / "bob" / "G_50.pth")  # logs 根存在，但没有 alice
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).delete("/api/models/alice.pth")
+
+    assert resp.status_code == 200
+    assert resp.json()["logs"] == {"target": None, "removed": False, "failed_files": []}
+    assert not (weights / "alice.pth").exists()
+
+
+def test_delete_group_from_intermediate_representative(monkeypatch, tmp_path):
+    """noFinal 组（训练中断只剩中间产物）：从代表项（中间轮次）发起删除同样删整组。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    _touch(weights / "alice_e20_s100.pth")  # 没有 alice.pth
+    logs_exp = _make_logs(tmp_path, "alice")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).delete("/api/models/alice_e20_s100.pth")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted_models"] == ["alice_e20_s100.pth"]
+    assert body["logs"]["removed"] is True
+    assert not logs_exp.exists()
+
+
+class _StubTaskManager:
+    """list_tasks 返回预置快照的最小替身（_ensure_exp_idle 只用这三个键）。"""
+
+    def __init__(self, snapshots):
+        self._snapshots = snapshots
+
+    def list_tasks(self):
+        return self._snapshots
+
+
+@pytest.mark.parametrize("meta_exp,weight_name", [
+    ("alice", "alice.pth"),  # 精确命中
+    ("alice", "Alice_e20_s100.pth"),  # lower 候选命中：文件名大小写与任务不一致
+    ("Alice", "Alice.pth"),  # 原始 case 候选命中
+])
+def test_delete_rejected_while_experiment_training(
+    monkeypatch, tmp_path, meta_exp, weight_name
+):
+    """在训守卫：实验存在非终态任务时 409，权重/索引/logs 原封不动。
+    守卫在 _ensure_exp_idle 内部解析 training 命名空间的 task_manager/_TASK_META，
+    故 patch 的是 training 模块而不是 models。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    _touch(weights / weight_name)
+    logs_exp = _make_logs(tmp_path, "alice")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", indices)
+    monkeypatch.setattr(
+        training_module, "task_manager", _StubTaskManager(
+            [{"id": "t1", "state": "running", "name": "train alice"}]
+        )
+    )
+    monkeypatch.setattr(training_module, "_TASK_META", {"t1": {"exp_name": meta_exp}})
+
+    resp = TestClient(create_app()).delete(f"/api/models/{weight_name}")
+
+    assert resp.status_code == 409
+    assert (weights / weight_name).exists()  # 一个字节都没动
+    assert logs_exp.exists()
+
+
+def test_delete_allowed_with_terminal_task(monkeypatch, tmp_path):
+    """终态任务不拦（重新提交同一实验是合法的重跑路径，守卫只挡非终态）。"""
+    weights = tmp_path / "weights"
+    _touch(weights / "alice.pth")
+    logs_exp = _make_logs(tmp_path, "alice")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+    monkeypatch.setattr(
+        training_module, "task_manager", _StubTaskManager(
+            [{"id": "t1", "state": "success", "name": "train alice"}]
+        )
+    )
+    monkeypatch.setattr(training_module, "_TASK_META", {"t1": {"exp_name": "alice"}})
+
+    resp = TestClient(create_app()).delete("/api/models/alice.pth")
+
+    assert resp.status_code == 200
+    assert resp.json()["logs"]["removed"] is True
+    assert not logs_exp.exists()
+
+
+def test_delete_group_reports_failed_models(monkeypatch, tmp_path):
+    """组内某个成员 unlink 失败：不回滚、不 500，failed_models 如实上报，
+    其余成员与 logs 照常删除。"""
+    weights = tmp_path / "weights"
+    stuck = weights / "alice_e10_s5000.pth"
+    real_delete = models_module._delete_file
+
+    def flaky(path):
+        if path.name == stuck.name:
+            raise PermissionError(13, "denied")
+        return real_delete(path)
+
+    _touch(weights / "alice.pth")
+    _touch(stuck)
+    _touch(weights / "alice_e20_s100.pth")
+    logs_exp = _make_logs(tmp_path, "alice")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+    monkeypatch.setattr(models_module, "_delete_file", flaky)
+
+    resp = TestClient(create_app()).delete("/api/models/alice.pth")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["failed_models"] == [stuck.name]
+    assert stuck.exists()  # 删不掉的就是还在
+    assert sorted(body["deleted_models"]) == ["alice.pth", "alice_e20_s100.pth"]
+    assert body["logs"]["removed"] is True
+    assert not logs_exp.exists()
+
+
+def test_delete_named_model_failure_is_500_and_leaves_group(monkeypatch, tmp_path):
+    """点名权重自身 unlink 失败 → 500：删除未发生，整组（权重/索引/logs）原样。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    named = weights / "alice.pth"
+    real_delete = models_module._delete_file
+
+    def flaky(path):
+        if path.name == named.name:
+            raise PermissionError(13, "denied")
+        return real_delete(path)
+
+    _touch(named)
+    _touch(weights / "alice_e20_s100.pth")
+    added = _touch(indices / "added_IVF1_Flat_nprobe_1_alice.index")
+    logs_exp = _make_logs(tmp_path, "alice")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", indices)
+    monkeypatch.setattr(models_module, "_delete_file", flaky)
+
+    resp = TestClient(create_app()).delete("/api/models/alice.pth")
+
+    assert resp.status_code == 500
+    assert named.exists() and (weights / "alice_e20_s100.pth").exists()
+    assert added.exists() and logs_exp.exists()
+
+
+def test_delete_group_reports_partial_logs_failure(monkeypatch, tmp_path):
+    """logs 树部分文件删不掉：200 + logs.removed=False + failed_files 上报，
+    权重与索引不回滚（它们才是本接口的产品，logs 只是附带清理）。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    _touch(weights / "alice.pth")
+    added = _touch(indices / "added_IVF1_Flat_nprobe_1_alice.index")
+    logs_exp = _make_logs(tmp_path, "alice")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", indices)
+
+    def half_broken_rmtree(directory, failed_files):
+        failed_files.append("G_50.pth")  # 模拟残留：目录本身不动
+
+    monkeypatch.setattr(models_module, "_rmtree_best_effort", half_broken_rmtree)
+
+    resp = TestClient(create_app()).delete("/api/models/alice.pth")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["logs"] == {"target": str(logs_exp), "removed": False, "failed_files": ["G_50.pth"]}
+    assert body["deleted_models"] == ["alice.pth"]
+    assert not added.exists()
+
+
+def test_delete_group_sweeps_residual_links_into_logs(monkeypatch, tmp_path):
+    """删 logs 后清扫仍指向它的残余软链（spkid / 悬空链，不在配对候选里），
+    指向别的实验的链接不受牵连。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    _touch(weights / "alice.pth")
+    indices.mkdir(parents=True, exist_ok=True)
+    real_index = _touch(tmp_path / "logs" / "alice" / "added_alice.index")
+    spkid = indices / "added_IVF1_alice_spkid3.index"
+    spkid.symlink_to(real_index)
+    dangling = indices / "alice_added_IVF2.index"
+    dangling.symlink_to(tmp_path / "logs" / "alice" / "ghost.index")  # 目标本就不存在
+    foreign_real = _touch(tmp_path / "logs" / "bob" / "added_bob.index")
+    foreign = indices / "added_IVF1_bob.index"
+    foreign.symlink_to(foreign_real)
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", indices)
+
+    resp = TestClient(create_app()).delete("/api/models/alice.pth")
+
+    assert resp.status_code == 200
+    assert resp.json()["logs"]["removed"] is True
+    assert not spkid.exists()  # 指向被删 logs 的残余链接被清扫
+    assert not dangling.exists()
+    assert foreign.exists()  # 别人的链接不受牵连
+    assert not (tmp_path / "logs" / "alice").exists()
+
+
+def test_delete_group_keeps_other_experiment_logs(monkeypatch, tmp_path):
+    """logs 清理的精确性：删 alice 组不得动 logs/bobby（与索引不牵连对偶）。"""
+    weights = tmp_path / "weights"
+    _touch(weights / "alice.pth")
+    alice_logs = _make_logs(tmp_path, "alice")
+    bobby_logs = _make_logs(tmp_path, "bobby")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = TestClient(create_app()).delete("/api/models/alice.pth")
+
+    assert resp.status_code == 200
+    assert not alice_logs.exists()
+    assert bobby_logs.exists()
+    assert (bobby_logs / "G_50.pth").exists()
 
 
 # ---------------------------------------------------------------------------
