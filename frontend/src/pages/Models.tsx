@@ -14,6 +14,7 @@ import {
   DownloadIcon,
   LoaderCircleIcon,
   RefreshCwIcon,
+  UploadIcon,
 } from 'lucide-react'
 
 import { api, type ModelVersion, type RvcModel } from '@/api/client'
@@ -21,6 +22,7 @@ import { useTask } from '@/hooks/useTask'
 import { EXP_NAME_RE, experimentName, groupModels, parseEpochSuffix } from '@/lib/domain'
 import { errorMessage } from '@/lib/utils'
 import { ErrorDetail } from '@/components/ErrorDetail'
+import { ModelUploadForm } from '@/components/ModelUploadForm'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -101,6 +103,8 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
   const [loadError, setLoadError] = useState<string | null>(null)
   // 手动刷新 / 删除成功 / 补训索引成功都通过递增它触发重新拉取
   const [reloadTick, setReloadTick] = useState(0)
+  // 导入外部模型表单的展开态；上传成功后表单内自行展示回执，列表靠 reloadTick 重取
+  const [uploadOpen, setUploadOpen] = useState(false)
 
   // -- 删除（两段式确认） ---------------------------------------------------
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
@@ -253,20 +257,40 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
             <CardDescription>
               查看 assets/weights 中的音色模型，删除或补建检索索引；同一次训练的
               中间轮次产物收进各组卡片下方的折叠列表，最近训练的组排在最前。
+              也可导入外部模型文件（pth + 可选索引）。
             </CardDescription>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setReloadTick((t) => t + 1)}
-            disabled={models === null && loadError === null}
-          >
-            <RefreshCwIcon />
-            刷新
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setUploadOpen((o) => !o)}
+            >
+              <UploadIcon />
+              {uploadOpen ? '收起导入' : '导入模型'}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setReloadTick((t) => t + 1)}
+              disabled={models === null && loadError === null}
+            >
+              <RefreshCwIcon />
+              刷新
+            </Button>
+          </div>
         </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
+        {uploadOpen && (
+          <div className="flex flex-col gap-3 rounded-lg border p-4">
+            <span className="text-sm font-medium">导入外部模型</span>
+            <p className="text-xs text-muted-foreground">
+              导入后与训练产出的模型同等对待：出现在推理页下拉框，可下载、可删除。
+            </p>
+            <ModelUploadForm onUploaded={() => setReloadTick((t) => t + 1)} />
+          </div>
+        )}
         {loadError !== null && (
           <p
             role="alert"
@@ -283,7 +307,8 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
         {models !== null && models.length === 0 && (
           <div className="flex flex-col items-start gap-3 rounded-lg bg-muted p-4">
             <p className="text-sm text-muted-foreground">
-              还没有模型——去训练页训练第一个音色吧。
+              还没有模型——去训练页训练第一个音色，或点右上角「导入模型」导入已有的
+              pth / index 文件。
             </p>
             <Button size="sm" onClick={onGoTrain}>
               去训练

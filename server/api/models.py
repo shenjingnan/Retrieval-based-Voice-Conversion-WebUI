@@ -1,15 +1,18 @@
 """扫描 assets/weights 与 assets/indices，返回模型及其索引配对；
-删除模型 = 彻底删除：整组权重 + 配对索引 + logs/{exp} 训练产物。"""
+删除模型 = 彻底删除：整组权重 + 配对索引 + logs/{exp} 训练产物；
+上传模型 = 外部音色模型导入：校验后写入 weights/indices，入库即生效。"""
 import contextlib
 import logging
+import os
 import re
 import zipfile
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from server import paths
@@ -350,3 +353,119 @@ def download_model(name: str):
         media_type="application/zip",
         headers={"Content-Disposition": _content_disposition(f"{stem}.zip")},
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/models/upload（外部音色模型导入）
+# ---------------------------------------------------------------------------
+
+# 与 datasets.MAX_FILE_BYTES 同口径的 500MB：最终产物 pth 通常 55~170MB，大实验的
+# 索引可到百 MB 级。上限在拷贝循环按实际字节数强制——请求体在 handler 之前已被
+# Starlette 整体 spool，这里拦的是「目标目录被污染」，不是带宽。
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024
+# 流式拷贝粒度：与 datasets.CHUNK_BYTES 同值同理由（spool 阈值也是 1MB）
+_COPY_CHUNK = 1024 * 1024
+# torch>=1.6 的 torch.save 是 zip 容器：魔数把「改后缀的杂鱼文件」拦在上传口。
+# torch<1.6 的旧式非 zip 存档不放行——在产的 RVC 社区模型没有这种形态，误放行的
+# 代价是坏模型混进列表、推理期才炸，提示远不如上传口明确。
+_PTH_MAGIC = b"PK\x03\x04"
+
+
+def _safe_upload_name(raw: str | None, kind: str) -> str:
+    """multipart filename → 严格校验的单段文件名。
+
+    与 datasets._safe_filename 的宽松清洗不同：模型名要往返 URL（删除/下载路由，
+    单段路由匹配兜不住分隔符），且必须与 _scan 的 *.pth glob 口径一致，故不做
+    静默改写——含路径分隔符（正反斜杠都算，Windows 客户端塞整路径时明确报错而不是
+    悄悄换个名字入库）、控制字符、点名的名字一律 400。
+    """
+    name = raw or ""
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or any(ord(ch) < 0x20 for ch in name)
+    ):
+        raise HTTPException(400, f"{kind}文件名非法: {name!r}")
+    return name
+
+
+def _save_upload(upload: UploadFile, dest: Path, magic: bytes | None) -> None:
+    """把上传 spool 流式落到 dest：同目录隐匿 .part 临时文件 + os.replace 原子改名。
+
+    限额在拷贝循环按实际字节数强制（Content-Length 可谎报）；超限 / 魔数不符 /
+    IO 失败一律先删 .part 再上抛——磁盘上只允许出现完整文件（与 datasets._save_stream
+    同纪律）。.part 名带 uuid：并发同名上传互不践踏，且后缀不会被 _scan 的 glob
+    列出，即便残留也不进列表。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)  # 测试把目录指到 tmp 时可能尚不存在
+    tmp = dest.with_name(f".{dest.name}.{uuid4().hex}.part")
+    try:
+        with tmp.open("wb") as out:
+            if magic is not None:
+                head = upload.file.read(len(magic))
+                if head != magic:
+                    raise HTTPException(
+                        400,
+                        f"{dest.name} 不是有效的 .pth 文件（缺少 torch zip 容器头），"
+                        "请确认文件完整且由 RVC 导出",
+                    )
+                out.write(head)
+            while chunk := upload.file.read(_COPY_CHUNK):
+                if out.tell() + len(chunk) > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"{dest.name} 超过大小上限（500MB）")
+                out.write(chunk)
+        if dest.exists():  # 复核：封住入口查重到落盘之间的竞态窗口
+            raise HTTPException(409, f"文件在上传期间已出现: {dest.name}")
+        os.replace(tmp, dest)
+    except BaseException:  # noqa: BLE001 半成品清理必须覆盖 4xx 与 IO 错误两条路径
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+
+
+@router.post("/models/upload")
+def upload_model(
+    model: UploadFile = File(...),
+    index: UploadFile | None = File(None),
+):
+    """导入外部音色模型：pth 必选、配对索引可选，校验通过后写入 weights/indices。
+
+    入库即生效：写盘成功后 GET /api/models 的既有扫描、索引配对、推理、下载、
+    删除全部自然覆盖（推理只认这两个目录，见模块 docstring），不需要任何登记步骤。
+    响应是与 GET /api/models 条目同构的对象（含按配对规则回查的 index）。
+
+    重名一律 409 拒绝且两目录独立查重：覆盖藏在「上传」里会绕过显式的彻底删除
+    确认；自动改名则扰乱索引配对与训练产物命名。任何拒绝（含 index 一侧非法）
+    都发生在落盘之前或触发整体回滚，不产生半成品。"""
+    model_name = _safe_upload_name(model.filename, "模型")
+    if not model_name.endswith(".pth"):
+        raise HTTPException(400, f"模型文件必须是 .pth 后缀（小写）: {model_name}")
+    index_name = None
+    if index is not None:
+        index_name = _safe_upload_name(index.filename, "索引")
+        if not index_name.endswith(".index"):
+            raise HTTPException(400, f"索引文件必须是 .index 后缀（小写）: {index_name}")
+    if (paths.WEIGHTS_DIR / model_name).exists():
+        raise HTTPException(409, f"模型已存在: {model_name}，如需替换请先删除")
+    if index_name is not None and (paths.INDICES_DIR / index_name).exists():
+        raise HTTPException(409, f"索引已存在: {index_name}，如需替换请先删除")
+
+    dest_model = paths.WEIGHTS_DIR / model_name
+    dest_index = paths.INDICES_DIR / index_name if index_name is not None else None
+    try:
+        _save_upload(model, dest_model, _PTH_MAGIC)
+        if dest_index is not None:
+            _save_upload(index, dest_index, None)
+    except BaseException:
+        # 整体回滚：一半成功一半失败对「上传成对文件」的意图是谎言，让用户修好
+        # 对应一侧后整套重传（「有模型无索引」的合法形态只来自用户本来就只传 pth，
+        # 而不是残缺的事务）
+        with contextlib.suppress(OSError):
+            dest_model.unlink(missing_ok=True)
+        raise
+
+    for entry in _scan():
+        if entry["name"] == model_name:
+            return entry
+    raise HTTPException(500, "上传已落盘但模型未出现在列表中")  # 理论不可达：落盘名即 glob 口径

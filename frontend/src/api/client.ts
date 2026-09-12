@@ -279,6 +279,42 @@ export const api = {
   modelDownloadUrl: (name: string): string =>
     `/api/models/${encodeURIComponent(name)}/download`,
 
+  /**
+   * 导入外部音色模型（POST /api/models/upload：pth 必选 + index 可选），返回值与
+   * GET /api/models 条目同构（index 字段是服务端按配对规则回查的结果）。
+   * 与 uploadDataset 同理必须用 XMLHttpRequest：请求体的上传进度只有
+   * xhr.upload.onprogress 能拿到；进度条对几百 MB 的 pth 是刚需。
+   */
+  uploadModel: (
+    model: File,
+    index: File | null,
+    onProgress: (pct: number) => void,
+  ): Promise<RvcModel> =>
+    new Promise<RvcModel>((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', '/api/models/upload')
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+      }
+      xhr.onerror = () => reject(new Error('网络错误，上传中断'))
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText) as RvcModel)
+          } catch {
+            reject(new Error(`HTTP ${xhr.status}`))
+          }
+          return
+        }
+        reject(errorFromText(xhr.responseText, xhr.status))
+      }
+      const form = new FormData()
+      // 字段名与 server/api/models.py upload_model 的参数逐字对齐
+      form.append('model', model, model.name)
+      if (index !== null) form.append('index', index, index.name)
+      xhr.send(form)
+    }),
+
   infer: (form: FormData): Promise<Blob> =>
     fetch('/api/infer', { method: 'POST', body: form }).then(async (r) => {
       if (!r.ok) throw await errorFrom(r)
