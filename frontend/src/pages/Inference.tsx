@@ -6,6 +6,7 @@ import { ChevronDownIcon, DownloadIcon, LoaderCircleIcon } from 'lucide-react'
 
 import { api, type RvcModel } from '@/api/client'
 import { ErrorDetail } from '@/components/ErrorDetail'
+import { ModelUploadForm } from '@/components/ModelUploadForm'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -149,6 +150,13 @@ export function InferencePage({ initialModel = null, onModelConsumed }: Inferenc
     e.target.value = ''
   }
 
+  // 上传导入成功：上传响应即服务端扫描条目，本地并入列表（去重防同名竞态）并即时
+  // 选中——上传完即可推理。与下次进页 GET /api/models 的差异只有下拉顺序，不做整表重取
+  function onModelUploaded(model: RvcModel) {
+    setModels((cur) => [...(cur ?? []).filter((m) => m.name !== model.name), model])
+    setSelected(model.name)
+  }
+
   async function convert() {
     if (selected === null || file === null) return
     setBusy(true)
@@ -198,7 +206,7 @@ export function InferencePage({ initialModel = null, onModelConsumed }: Inferenc
             <p className="text-sm text-muted-foreground">正在加载模型列表…</p>
           ) : models !== null && models.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              assets/weights 中没有模型；训练方法见 P2。
+              还没有音色模型——可以去训练，或在下方导入已有模型文件。
             </p>
           ) : (
             <>
@@ -221,6 +229,16 @@ export function InferencePage({ initialModel = null, onModelConsumed }: Inferenc
               )}
             </>
           )}
+          {/* 上传入口常驻（列表为空/加载失败时也能导入）；成功后列表就地并入并选中新模型 */}
+          <Collapsible>
+            <CollapsibleTrigger className={COLLAPSIBLE_TRIGGER_CLASS}>
+              上传音色模型
+              <ChevronDownIcon className="size-4 text-muted-foreground" />
+            </CollapsibleTrigger>
+            <CollapsibleContent className="pt-4">
+              <ModelUploadForm onUploaded={onModelUploaded} />
+            </CollapsibleContent>
+          </Collapsible>
         </div>
 
         <div className="flex flex-col gap-2">

@@ -798,3 +798,185 @@ def test_download_model_multi_segment_never_reaches_handler(monkeypatch, tmp_pat
 
     assert resp.status_code in (404, 405)
     assert (weights / "alice.pth").exists()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/models/upload（外部音色模型导入）
+# ---------------------------------------------------------------------------
+
+# pth 的 torch zip 容器魔数 + 伪内容：上传接口只做轻校验，不需要真实 checkpoint
+_PTH_BYTES = b"PK\x03\x04not-a-real-checkpoint"
+_IDX_BYTES = b"fake-faiss-index-bytes"
+
+
+def _upload(client, model=None, index=None):
+    """按字段名组装 multipart 上传；字段值为 (filename, bytes) 元组，None 表示不传。"""
+    files = []
+    if model is not None:
+        files.append(("model", model))
+    if index is not None:
+        files.append(("index", index))
+    return client.post("/api/models/upload", files=files)
+
+
+def test_upload_model_with_index_pairs_and_lists(monkeypatch, tmp_path):
+    """pth + index 双文件上传成功：两文件各自落盘，响应与 GET /api/models 条目
+    同构且索引已配对，列表接口能看到同一模型。"""
+    weights = tmp_path / "weights"
+    indices = tmp_path / "indices"
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", indices)
+    client = TestClient(create_app())
+
+    resp = _upload(
+        client,
+        model=("alice.pth", _PTH_BYTES),
+        index=("added_IVFxxx_alice.index", _IDX_BYTES),
+    )
+
+    assert resp.status_code == 200
+    assert (weights / "alice.pth").read_bytes() == _PTH_BYTES
+    assert (indices / "added_IVFxxx_alice.index").read_bytes() == _IDX_BYTES
+    listed = client.get("/api/models").json()
+    assert resp.json() in listed  # 响应条目与列表条目同构且一致
+    assert listed[0]["index"] == str(indices / "added_IVFxxx_alice.index")
+
+
+def test_upload_model_without_index(monkeypatch, tmp_path):
+    """只传 pth 是合法操作：响应与列表里 index 均为 None。"""
+    weights = tmp_path / "weights"
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+    client = TestClient(create_app())
+
+    resp = _upload(client, model=("bob.pth", _PTH_BYTES))
+
+    assert resp.status_code == 200
+    assert resp.json()["index"] is None
+    assert (weights / "bob.pth").exists()
+
+
+def test_upload_duplicate_model_name_is_409(monkeypatch, tmp_path):
+    """与 weights 下已有模型重名 → 409，原文件保持原样，也不写任何半成品。"""
+    weights = tmp_path / "weights"
+    original = _touch(weights / "alice.pth")
+    original.write_bytes(_PTH_BYTES)
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = _upload(
+        TestClient(create_app()), model=("alice.pth", _PTH_BYTES), index=("a.index", _IDX_BYTES)
+    )
+
+    assert resp.status_code == 409
+    assert original.read_bytes() == _PTH_BYTES  # 原内容未被覆盖
+    assert list(weights.iterdir()) == [original]  # 无 .part 残留
+    assert not (tmp_path / "indices" / "a.index").exists()  # 拒绝时索引也不落盘
+
+
+def test_upload_duplicate_index_name_is_409(monkeypatch, tmp_path):
+    """与 indices 下已有索引重名 → 409（两目录独立查重），模型也不落盘。"""
+    indices = tmp_path / "indices"
+    original = _touch(indices / "alice.index")
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", tmp_path / "weights")
+    monkeypatch.setattr("server.paths.INDICES_DIR", indices)
+
+    resp = _upload(
+        TestClient(create_app()), model=("alice.pth", _PTH_BYTES), index=("alice.index", _IDX_BYTES)
+    )
+
+    assert resp.status_code == 409
+    assert not (tmp_path / "weights" / "alice.pth").exists()
+
+
+@pytest.mark.parametrize(
+    ("model", "index"),
+    [
+        ("../evil.pth", ("ok.index", _IDX_BYTES)),  # 模型名穿越
+        ("ok.pth", ("../evil.index", _IDX_BYTES)),  # 索引名穿越
+    ],
+)
+def test_upload_rejects_traversal(monkeypatch, tmp_path, model, index):
+    """非 basename 一律 400，绝不落盘到目录之外。"""
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", tmp_path / "weights")
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = _upload(TestClient(create_app()), model=model, index=index)
+
+    assert resp.status_code == 400
+    assert not (tmp_path / "evil.pth").exists()
+    assert not (tmp_path / "evil.index").exists()
+    assert not (tmp_path / "weights" / "ok.pth").exists()
+    assert not (tmp_path / "indices" / "ok.index").exists()
+
+
+@pytest.mark.parametrize(
+    ("model", "index"),
+    [
+        ("notes.txt", ("ok.index", _IDX_BYTES)),  # 模型后缀非法
+        ("ok.pth", ("notes.idx", _IDX_BYTES)),  # 索引后缀非法：整体拒绝，模型也不落盘
+    ],
+)
+def test_upload_rejects_wrong_suffix(monkeypatch, tmp_path, model, index):
+    """后缀白名单：模型必须 .pth、索引必须 .index；任一非法整体拒绝（400），
+    校验发生在任何落盘之前。"""
+    weights = tmp_path / "weights"
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    model_bytes = _PTH_BYTES if model.endswith(".pth") else b"whatever"
+    resp = _upload(
+        TestClient(create_app()), model=(model, model_bytes), index=index
+    )
+
+    assert resp.status_code == 400
+    assert not (weights / "ok.pth").exists()
+
+
+def test_upload_rejects_uppercase_suffix(monkeypatch, tmp_path):
+    """后缀必须小写：_scan 的 glob 与配对口径大小写敏感，大写后缀会造出列表
+    看不见的文件，必须显式拒绝而不是静默改写。"""
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", tmp_path / "weights")
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = _upload(TestClient(create_app()), model=("ALICE.PTH", _PTH_BYTES))
+
+    assert resp.status_code == 400
+
+
+def test_upload_rejects_oversized(monkeypatch, tmp_path):
+    """超过大小上限 → 413，无任何落盘残留（含 .part 半成品）。"""
+    weights = tmp_path / "weights"
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+    monkeypatch.setattr("server.api.models.MAX_UPLOAD_BYTES", 16)
+
+    resp = _upload(
+        TestClient(create_app()), model=("big.pth", b"PK\x03\x04" + b"x" * 64)
+    )
+
+    assert resp.status_code == 413
+    assert list(weights.iterdir() if weights.exists() else []) == []
+
+
+def test_upload_rejects_non_zip_model_content(monkeypatch, tmp_path):
+    """pth 魔数校验：非 zip 容器（缺 PK\x03\x04）→ 400，不落盘。"""
+    weights = tmp_path / "weights"
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", weights)
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = _upload(TestClient(create_app()), model=("fake.pth", b"definitely not a zip"))
+
+    assert resp.status_code == 400
+    assert not (weights / "fake.pth").exists()
+    assert list(weights.iterdir() if weights.exists() else []) == []
+
+
+def test_upload_missing_model_field(monkeypatch, tmp_path):
+    """model 是必选 multipart 字段：缺省由 FastAPI 校验层拒绝（422）。"""
+    monkeypatch.setattr("server.paths.WEIGHTS_DIR", tmp_path / "weights")
+    monkeypatch.setattr("server.paths.INDICES_DIR", tmp_path / "indices")
+
+    resp = _upload(TestClient(create_app()), index=("a.index", _IDX_BYTES))
+
+    assert resp.status_code == 422
