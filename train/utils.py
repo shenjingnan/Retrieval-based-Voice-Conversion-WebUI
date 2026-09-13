@@ -10,7 +10,7 @@ import shutil
 import numpy as np
 import torch
 from scipy.io.wavfile import read
-from tools.file_io import read_text
+from tools.file_io import atomic_torch_save, read_text
 
 MATPLOTLIB_FLAG = False
 
@@ -163,7 +163,7 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path)
         state_dict = model.module.state_dict()
     else:
         state_dict = model.state_dict()
-    torch.save(
+    atomic_torch_save(
         {
             "model": state_dict,
             "iteration": iteration,
@@ -188,7 +188,7 @@ def save_checkpoint_d(combd, sbd, optimizer, learning_rate, iteration, checkpoin
         state_dict_sbd = sbd.module.state_dict()
     else:
         state_dict_sbd = sbd.state_dict()
-    torch.save(
+    atomic_torch_save(
         {
             "combd": state_dict_combd,
             "sbd": state_dict_sbd,
