@@ -7,7 +7,7 @@ from collections import OrderedDict
 import torch
 
 from i18n.i18n import I18nAuto
-from tools.file_io import read_text
+from tools.file_io import atomic_torch_save, read_text
 
 i18n = I18nAuto()
 
@@ -63,7 +63,7 @@ def savee(ckpt, sr, if_f0, name, epoch, version, hps):
         speaker_info = normalize_speaker_info(getattr(hps, "speaker_info", []))
         if speaker_info:
             opt["speaker_info"] = speaker_info
-        torch.save(opt, "assets/weights/%s.pth" % name)
+        atomic_torch_save(opt, "assets/weights/%s.pth" % name)
         return i18n("成功")
     except:
         return traceback.format_exc()
@@ -213,7 +213,7 @@ def extract_small_model(path, name, sr, if_f0, info, version):
         opt["f0"] = int(if_f0)
         if speaker_info:
             opt["speaker_info"] = speaker_info
-        torch.save(opt, "assets/weights/%s.pth" % name)
+        atomic_torch_save(opt, "assets/weights/%s.pth" % name)
         return i18n("成功")
     except:
         return traceback.format_exc()
