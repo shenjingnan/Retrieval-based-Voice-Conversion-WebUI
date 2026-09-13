@@ -119,11 +119,92 @@ export function parseEpochSuffix(
 }
 
 /**
+ * 模型文件名 → 分组键（groupModels 与推理页级联选择共用的键口径）：{exp}.pth 与
+ * {exp}_e{n}_s{n}.pth 同归实验名一组；剥不出实验名的退化文件名（如裸的
+ * _e20_s100.pth）用原始 stem 自成一组。
+ */
+export function modelGroupKey(modelName: string): string {
+  const stem = modelName.replace(/\.pth$/i, '')
+  const exp = experimentName(stem)
+  return exp.length > 0 ? exp : stem
+}
+
+/**
+ * 权重文件名的展示文案（推理页级联下拉与最近使用区共用）：最终产物显示「最终产物」，
+ * 中间轮次显示「第 N 轮 · step M」（与 Models 页子项文案同源）；命名不合规的
+ * 退化文件名原样展示。
+ */
+export function weightLabel(modelName: string, isFinal: boolean): string {
+  if (isFinal) return '最终产物'
+  const p = parseEpochSuffix(modelName.replace(/\.pth$/i, ''))
+  return p === null ? modelName : `第 ${p.epoch} 轮 · step ${p.step}`
+}
+
+/**
+ * 推理页「最近使用」模型条目：只在转换成功后记录（点击选择不算），浏览器
+ * localStorage 持久化，无 server 侧同源实现。
+ */
+export interface RecentModelEntry {
+  /** 权重文件名（weights 目录 basename，与 GET /api/models 条目 name 同口径） */
+  name: string
+  /** 最近一次转换成功时刻（epoch 毫秒） */
+  at: number
+}
+
+export const RECENT_MODELS_STORAGE_KEY = 'rvc.recent-models'
+/** 上限裁剪：最近使用是快捷入口不是档案，塞满一屏反而难选 */
+export const RECENT_MODELS_LIMIT = 8
+
+/**
+ * 纯函数：把 name 记到最前（已存在则摘除旧条目并更新时间），按上限裁剪。
+ * 不修改入参数组，返回新数组。
+ */
+export function recordRecentModel(
+  entries: RecentModelEntry[],
+  name: string,
+  at: number,
+): RecentModelEntry[] {
+  return [{ name, at }, ...entries.filter((e) => e.name !== name)].slice(
+    0,
+    RECENT_MODELS_LIMIT,
+  )
+}
+
+function isRecentEntry(e: unknown): e is RecentModelEntry {
+  if (typeof e !== 'object' || e === null) return false
+  const o = e as Record<string, unknown>
+  return (
+    typeof o.name === 'string' &&
+    o.name.length > 0 &&
+    typeof o.at === 'number' &&
+    Number.isFinite(o.at)
+  )
+}
+
+/**
+ * 从 localStorage 读取最近使用列表：JSON 解析失败 / 非数组 / 条目形状不对的
+ * 一律丢弃，返回值保证是合法数组——持久化数据损坏绝不能让推理页挂掉。
+ * storage 参数注入（而非直接摸 window.localStorage）是为了 node 环境可测。
+ */
+export function loadRecentModels(storage: Pick<Storage, 'getItem'>): RecentModelEntry[] {
+  try {
+    const raw = storage.getItem(RECENT_MODELS_STORAGE_KEY)
+    if (raw === null) return []
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(isRecentEntry)
+  } catch {
+    return []
+  }
+}
+
+/**
  * 模型列表按实验名聚合的分组视图（Models 页展示层专用，无 server 侧同源实现）：
  * 一次训练的全部产物——最终模型 {exp}.pth 与 save_every_weights 存下的中间轮次
- * {exp}_e{n}_s{n}.pth——折进同一个组。分组键与 experimentName 同口径（剥 _eX_sY
+ * {exp}_e{n}_s{n}.pth——折进同一个组。分组键见 modelGroupKey（剥 _eX_sY
  * 后缀取实验名）；剥不出后缀的退化文件名（如裸的 _e20_s100.pth）用原始 stem
- * 自成一组且当最终产物，展示与平铺列表完全一致。命名不合规的手动模型同理。
+ * 自成一组（该成员落 intermediates，组内无最终产物，代表项退化为它自身）。
+ * 命名不合规的手动模型同理。
  * 组间按最近文件时间（latest）倒序——最近训练的排最前；mtime 同秒时按 key
  * 字典序兜底，保证顺序稳定。组内仍按训练演进序（中间轮次 epoch 升序）。
  */
@@ -147,11 +228,11 @@ export function groupModels<T extends { name: string; mtime: number }>(
   const groups = new Map<string, { final: T | null; intermediates: T[] }>()
   for (const m of models) {
     const stem = stemOf(m.name)
-    const exp = experimentName(stem)
-    const key = exp.length > 0 ? exp : stem
+    const key = modelGroupKey(m.name)
     const entry = groups.get(key) ?? { final: null, intermediates: [] }
-    // 剥得动后缀（stem !== exp）= 中间轮次；剥不动 = 最终产物
-    if (stem === exp) entry.final = m
+    // 剥得动后缀（stem !== experimentName(stem)）= 中间轮次；剥不动 = 最终产物。
+    // 注意退化文件名（剥后为空串）这里落 intermediates，与键的「自成一组」是两回事
+    if (stem === experimentName(stem)) entry.final = m
     else entry.intermediates.push(m)
     groups.set(key, entry)
   }
