@@ -19,7 +19,7 @@ import {
 
 import { api, type ModelVersion, type RvcModel } from '@/api/client'
 import { useTask } from '@/hooks/useTask'
-import { EXP_NAME_RE, experimentName, groupModels, parseEpochSuffix } from '@/lib/domain'
+import { EXP_NAME_RE, experimentName, groupModels, weightLabel } from '@/lib/domain'
 import { errorMessage } from '@/lib/utils'
 import { ErrorDetail } from '@/components/ErrorDetail'
 import { ModelUploadForm } from '@/components/ModelUploadForm'
@@ -593,7 +593,6 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                   <CollapsibleContent>
                     <div className="flex flex-col divide-y pt-1">
                       {g.intermediates.map((m) => {
-                        const epoch = parseEpochSuffix(m.name.replace(/\.pth$/i, ''))
                         return (
                           <div
                             key={m.name}
@@ -603,9 +602,8 @@ export function ModelsPage({ onGoInfer, onGoTrain }: ModelsPageProps) {
                               className="truncate font-mono text-xs"
                               title={m.name}
                             >
-                              {epoch === null
-                                ? m.name
-                                : `第 ${epoch.epoch} 轮 · step ${epoch.step}`}
+                              {/* 轮次文案与推理页权重下拉同源（domain.weightLabel） */}
+                              {weightLabel(m.name, false)}
                             </span>
                             <div className="flex items-center gap-2">
                               <Button

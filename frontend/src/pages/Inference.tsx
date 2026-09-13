@@ -1,10 +1,21 @@
 /**
- * 推理页（P1）：模型选择 + 基础/专家参数分层 + 转换前后 A/B 对比试听。
+ * 推理页（P1）：模型选择（主模型 → 权重两级级联，中间轮次收进权重下拉，与
+ * Models 页 groupModels 同口径）+ 最近使用快捷区（转换成功才记录，localStorage
+ * 持久化）+ 基础/专家参数分层 + 转换前后 A/B 对比试听。
  */
-import { useEffect, useRef, useState, type ChangeEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { ChevronDownIcon, DownloadIcon, LoaderCircleIcon } from 'lucide-react'
 
 import { api, type RvcModel } from '@/api/client'
+import {
+  groupModels,
+  loadRecentModels,
+  modelGroupKey,
+  RECENT_MODELS_STORAGE_KEY,
+  recordRecentModel,
+  weightLabel,
+  type RecentModelEntry,
+} from '@/lib/domain'
 import { ErrorDetail } from '@/components/ErrorDetail'
 import { ModelUploadForm } from '@/components/ModelUploadForm'
 import { Button } from '@/components/ui/button'
@@ -73,7 +84,15 @@ export function InferencePage({ initialModel = null, onModelConsumed }: Inferenc
   // null 表示模型列表仍在加载；[] 表示已加载但 assets/weights 为空
   const [models, setModels] = useState<RvcModel[] | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
+  // 级联第一级：当前选中的主模型（实验组键）。切组时 selected 自动落为该组代表项
+  const [selectedGroup, setSelectedGroup] = useState<string | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
+  // 最近使用（转换成功才记录）：懒初始化读 localStorage，损坏数据由 loadRecentModels 兜底
+  const [recent, setRecent] = useState<RecentModelEntry[]>(() =>
+    loadRecentModels(window.localStorage),
+  )
+  // recordRecent 在 convert 的异步回调里执行：镜像一份 ref，避免闭包读到过期 state
+  const recentRef = useRef(recent)
   const [transpose, setTranspose] = useState(0)
   const [f0Method, setF0Method] = useState<F0Method>('rmvpe')
   const [indexRate, setIndexRate] = useState(0.75)
@@ -101,7 +120,7 @@ export function InferencePage({ initialModel = null, onModelConsumed }: Inferenc
         setModels(list)
         const model = linkedModel.current
         if (model !== null) {
-          if (list.some((m) => m.name === model)) setSelected(model)
+          if (list.some((m) => m.name === model)) selectModel(model)
           linkedCallback.current?.()
         }
       })
@@ -139,6 +158,55 @@ export function InferencePage({ initialModel = null, onModelConsumed }: Inferenc
     selected === null ? '请先选择模型' : file === null ? '请先选择音频文件' : null
   const canConvert = !busy && missingHint === null && models !== null
 
+  // 平铺列表 → 按实验名聚合（与 Models 页同款 groupModels），级联下拉的数据源
+  const groups = useMemo(() => (models === null ? [] : groupModels(models)), [models])
+  const currentGroup =
+    selectedGroup === null ? null : (groups.find((g) => g.key === selectedGroup) ?? null)
+  // 该组有中间轮次才出权重下拉：只有一个必然答案（最终产物）时不问第二次
+  const hasIntermediates = currentGroup !== null && currentGroup.intermediates.length > 0
+  // 最近使用 chips：与当前模型列表取交集——已删除的模型不展示（localStorage 残留无害）
+  const recentModels = useMemo(() => {
+    if (models === null) return []
+    const known = new Set(models.map((m) => m.name))
+    return recent.filter((e) => known.has(e.name))
+  }, [models, recent])
+
+  // 切主模型：权重自动落为该组代表项（最终产物 ?? 最大轮次，与 Models 页同口径）
+  function onGroupChange(key: string) {
+    const g = groups.find((x) => x.key === key)
+    if (g === undefined) return
+    setSelectedGroup(g.key)
+    setSelected(g.representative.name)
+  }
+
+  // 组与权重一起落定（最近使用 chip / 跨 Tab 联动 / 上传导入共用）：两者永远同源，
+  // 都由同一个文件名推导，不会出现组与权重错位
+  function selectModel(name: string) {
+    setSelectedGroup(modelGroupKey(name))
+    setSelected(name)
+  }
+
+  // 最近使用 chip 文案：组名 · 权重标签；命名不合规的退化文件名原样展示
+  function recentChipLabel(name: string): string {
+    const g = groups.find((x) => x.key === modelGroupKey(name))
+    if (g === undefined) return name
+    const w = weightLabel(name, g.final?.name === name)
+    return w === name ? name : `${g.key} · ${w}`
+  }
+
+  // 转换成功才记：失败/坏模型不污染快捷入口。持久化失败（隐私模式/配额满）只丢
+  // 跨会话记忆，不影响本次会话内的使用
+  function recordRecent(name: string) {
+    const next = recordRecentModel(recentRef.current, name, Date.now())
+    recentRef.current = next
+    setRecent(next)
+    try {
+      window.localStorage.setItem(RECENT_MODELS_STORAGE_KEY, JSON.stringify(next))
+    } catch {
+      // 忽略：内存态已更新
+    }
+  }
+
   function onFileChange(e: ChangeEvent<HTMLInputElement>) {
     const picked = e.target.files?.[0] ?? null
     if (picked === null) return // 取消选择：保持现状，不清结果
@@ -154,7 +222,7 @@ export function InferencePage({ initialModel = null, onModelConsumed }: Inferenc
   // 选中——上传完即可推理。与下次进页 GET /api/models 的差异只有下拉顺序，不做整表重取
   function onModelUploaded(model: RvcModel) {
     setModels((cur) => [...(cur ?? []).filter((m) => m.name !== model.name), model])
-    setSelected(model.name)
+    selectModel(model.name)
   }
 
   async function convert() {
@@ -175,8 +243,11 @@ export function InferencePage({ initialModel = null, onModelConsumed }: Inferenc
     try {
       const blob = await api.infer(form)
       const url = URL.createObjectURL(blob)
-      if (mounted.current) setOutUrl(url)
-      else URL.revokeObjectURL(url) // 已卸载：立即回收，避免悬挂 blob
+      if (mounted.current) {
+        setOutUrl(url)
+        // form 里的 model 就是这份 selected（提交时快照），转换成功才计入最近使用
+        recordRecent(selected)
+      } else URL.revokeObjectURL(url) // 已卸载：立即回收，避免悬挂 blob
     } catch (e) {
       if (mounted.current) setError(errorMessage(e))
     } finally {
@@ -210,18 +281,72 @@ export function InferencePage({ initialModel = null, onModelConsumed }: Inferenc
             </p>
           ) : (
             <>
-              <Select value={selected} onValueChange={setSelected}>
+              {/* 主模型下拉（一次训练的实验名，最近训练的组排前面） */}
+              <Select
+                value={selectedGroup}
+                onValueChange={(v) => v !== null && onGroupChange(v)}
+              >
                 <SelectTrigger className="w-full">
-                  <SelectValue placeholder="选择要使用的音色模型" />
+                  <SelectValue placeholder="选择主模型（一次训练的实验）" />
                 </SelectTrigger>
                 <SelectContent>
-                  {(models ?? []).map((m) => (
-                    <SelectItem key={m.name} value={m.name}>
-                      {m.name}
+                  {groups.map((g) => (
+                    <SelectItem key={g.key} value={g.key}>
+                      {g.key}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
+              {/* 权重级联：该组有中间轮次才出现，默认落在代表项上。最终产物置顶，
+                  中间轮次按 epoch 升序（训练演进顺序，与 Models 页一致） */}
+              {hasIntermediates && currentGroup !== null && (
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-sm font-medium">权重</span>
+                  <Select
+                    value={selected}
+                    onValueChange={(v) => v !== null && setSelected(v)}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="选择权重" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {currentGroup.final !== null && (
+                        <SelectItem
+                          key={currentGroup.final.name}
+                          value={currentGroup.final.name}
+                        >
+                          最终产物
+                        </SelectItem>
+                      )}
+                      {currentGroup.intermediates.map((m) => (
+                        <SelectItem key={m.name} value={m.name}>
+                          {weightLabel(m.name, false)}
+                          {currentGroup.final === null &&
+                            m.name === currentGroup.representative.name &&
+                            '（尚无最终产物）'}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+              {/* 最近使用快捷区：转换成功才记录，点击整组选中（主模型 + 权重一起落定） */}
+              {recentModels.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs text-muted-foreground">最近使用：</span>
+                  {recentModels.map((e) => (
+                    <Button
+                      key={e.name}
+                      size="sm"
+                      variant="outline"
+                      onClick={() => selectModel(e.name)}
+                      title={e.name}
+                    >
+                      {recentChipLabel(e.name)}
+                    </Button>
+                  ))}
+                </div>
+              )}
               {paired !== null && paired.index === null && (
                 <p className="text-xs text-amber-600 dark:text-amber-400">
                   该模型没有配对索引，音色相似度会打折
